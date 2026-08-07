@@ -31,6 +31,7 @@ object VextaTransactionSender {
     private const val sighashAll = 1L
     private const val sequence = 0xffffffffL
     private const val dustLimit = 546L
+    private const val defaultFeeSatoshisPerKb = 100_000L
 
     data class CreatedTransaction(
         val rawTransaction: ByteArray,
@@ -317,10 +318,9 @@ object VextaTransactionSender {
                 inputCount * 69L +
                 outputCount * 31L
 
-        return maxOf(
-            1_000L,
-            virtualBytes * 10L
-        )
+        return (
+            virtualBytes * defaultFeeSatoshisPerKb + 999L
+        ) / 1_000L
     }
 
     private fun addressToScript(address: String): ByteArray {
