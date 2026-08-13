@@ -1,6 +1,7 @@
 package org.vextaproject.wallet
 
 import androidx.fragment.app.FragmentActivity
+import androidx.activity.OnBackPressedCallback
 import androidx.biometric.BiometricManager
 import androidx.biometric.BiometricPrompt
 import androidx.core.content.ContextCompat
@@ -34,6 +35,7 @@ import android.security.keystore.KeyProperties
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
+import android.view.MotionEvent
 import android.view.ViewGroup
 import android.view.WindowManager
 import android.widget.Button
@@ -117,6 +119,7 @@ class WalletActivity : FragmentActivity() {
     private var automaticScanStarted = false
     private var blockchainScanRunning = false
     private var sendInProgress = false
+    private var lastExitSwipeAt = 0L
     private var latestSpendableUtxos =
         emptyList<BlockScanner.SpendableUtxo>()
 
@@ -241,6 +244,44 @@ class WalletActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        onBackPressedDispatcher.addCallback(
+            this,
+            object : OnBackPressedCallback(true) {
+                override fun handleOnBackPressed() {
+                    if (!walletExists()) {
+                        isEnabled = false
+                        onBackPressedDispatcher.onBackPressed()
+                        isEnabled = true
+                        return
+                    }
+
+                    if (!mainWalletVisible) {
+                        showMainWallet()
+                        return
+                    }
+
+                    val now = System.currentTimeMillis()
+
+                    if (now - lastExitSwipeAt <= 2_000L) {
+                        stopService(
+                            Intent(
+                                this@WalletActivity,
+                                WalletMonitoringService::class.java
+                            )
+                        )
+                        finishAndRemoveTask()
+                    } else {
+                        lastExitSwipeAt = now
+                        Toast.makeText(
+                            this@WalletActivity,
+                            "Swipe again to exit",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            }
+        )
+
         createPaymentNotificationChannel()
         requestNotificationPermission()
 
@@ -309,6 +350,38 @@ class WalletActivity : FragmentActivity() {
                     startHeaderSyncAndScan()
                 }
             }, 400L)
+        }
+    }
+
+    @Deprecated("Deprecated in Java")
+    override fun onBackPressed() {
+        if (!walletExists()) {
+            super.onBackPressed()
+            return
+        }
+
+        if (!mainWalletVisible) {
+            showMainWallet()
+            return
+        }
+
+        val now = System.currentTimeMillis()
+
+        if (now - lastExitSwipeAt <= 2_000L) {
+            stopService(
+                Intent(
+                    this,
+                    WalletMonitoringService::class.java
+                )
+            )
+            finishAndRemoveTask()
+        } else {
+            lastExitSwipeAt = now
+            Toast.makeText(
+                this,
+                "Swipe again to exit",
+                Toast.LENGTH_SHORT
+            ).show()
         }
     }
 
@@ -1223,14 +1296,11 @@ class WalletActivity : FragmentActivity() {
             }
         )
 
-        content.addView(space(20))
-        content.addView(
-            primaryButton("Back to wallet") {
+        setContentView(
+            scroll(content) {
                 showMainWallet()
             }
         )
-
-        setContentView(scroll(content))
     }
 
     private fun currentVersionName(): String {
@@ -1555,7 +1625,28 @@ class WalletActivity : FragmentActivity() {
         )
         content.addView(space(12))
 
-        setContentView(scroll(content))
+        setContentView(
+            scroll(content) {
+                val now = System.currentTimeMillis()
+
+                if (now - lastExitSwipeAt <= 2_000L) {
+                    stopService(
+                        Intent(
+                            this,
+                            WalletMonitoringService::class.java
+                        )
+                    )
+                    finishAndRemoveTask()
+                } else {
+                    lastExitSwipeAt = now
+                    Toast.makeText(
+                        this,
+                        "Swipe again to exit",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        )
 
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 60_000L)
@@ -1747,14 +1838,11 @@ class WalletActivity : FragmentActivity() {
             }
         )
 
-        content.addView(space(20))
-        content.addView(
-            primaryButton("Back to wallet") {
+        setContentView(
+            scroll(content) {
                 showMainWallet()
             }
         )
-
-        setContentView(scroll(content))
     }
 
     private fun waitForTransactionAcceptance(
@@ -2166,12 +2254,11 @@ class WalletActivity : FragmentActivity() {
             }
         )
 
-        content.addView(space(20))
-        content.addView(secondaryButton("Back to wallet") {
-            showMainWallet()
-        })
-
-        setContentView(scroll(content))
+        setContentView(
+            scroll(content) {
+                showMainWallet()
+            }
+        )
     }
 
     private fun insertScannedAddress(rawValue: String?) {
@@ -2702,8 +2789,41 @@ class WalletActivity : FragmentActivity() {
         }
     }
 
-    private fun scroll(content: View): ScrollView {
-        return ScrollView(this).apply {
+    private fun scroll(
+        content: View,
+        onSwipeBack: (() -> Unit)? = null
+    ): ScrollView {
+        return object : ScrollView(this) {
+            private var downX = 0f
+            private var downY = 0f
+
+            override fun dispatchTouchEvent(event: MotionEvent): Boolean {
+                if (onSwipeBack != null) {
+                    when (event.actionMasked) {
+                        MotionEvent.ACTION_DOWN -> {
+                            downX = event.x
+                            downY = event.y
+                        }
+
+                        MotionEvent.ACTION_UP -> {
+                            val dx = event.x - downX
+                            val dy = kotlin.math.abs(event.y - downY)
+
+                            if (
+                                downX <= width - dp(40) &&
+                                dx <= -dp(120) &&
+                                dy <= dp(100)
+                            ) {
+                                onSwipeBack()
+                                return true
+                            }
+                        }
+                    }
+                }
+
+                return super.dispatchTouchEvent(event)
+            }
+        }.apply {
             setBackgroundColor(backgroundColor)
             addView(content)
         }
