@@ -5,6 +5,8 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:allowBackup="false"
@@ -28,6 +30,15 @@
             android:theme="@style/SyncActivityTheme"
             android:noHistory="true"
             android:excludeFromRecents="true" />
+
+        <service
+            android:name=".WalletMonitoringService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Monitors Vexta wallet for incoming blockchain payments while the app is in the background." />
+        </service>
 
         <meta-data
             android:name="com.google.mlkit.vision.DEPENDENCIES"

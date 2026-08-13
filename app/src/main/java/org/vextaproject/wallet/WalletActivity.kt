@@ -1,6 +1,9 @@
 package org.vextaproject.wallet
 
-import android.app.Activity
+import androidx.fragment.app.FragmentActivity
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
+import androidx.core.content.ContextCompat
 import android.app.PendingIntent
 import android.app.NotificationManager
 import android.app.NotificationChannel
@@ -66,7 +69,7 @@ import javax.crypto.KeyGenerator
 import javax.crypto.SecretKey
 import javax.crypto.spec.GCMParameterSpec
 
-class WalletActivity : Activity() {
+class WalletActivity : FragmentActivity() {
 
     companion object {
         private const val PREFS = "vexta_wallet"
@@ -124,11 +127,14 @@ class WalletActivity : Activity() {
             if (
                 !isFinishing &&
                 !isDestroyed &&
-                hasWindowFocus() &&
                 walletExists() &&
-                walletBalanceView != null
+                !blockchainScanRunning
             ) {
-                startHeaderSyncAndScan()
+                if (hasWindowFocus()) {
+                    startHeaderSyncAndScan()
+                } else {
+                    startBackgroundHeaderSyncAndScan()
+                }
             }
 
             refreshHandler.postDelayed(this, 60_000L)
@@ -238,6 +244,15 @@ class WalletActivity : Activity() {
         createPaymentNotificationChannel()
         requestNotificationPermission()
 
+        val monitoringIntent =
+            Intent(this, WalletMonitoringService::class.java)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(monitoringIntent)
+        } else {
+            startService(monitoringIntent)
+        }
+
         val filter = IntentFilter(
             DownloadManager.ACTION_DOWNLOAD_COMPLETE
         )
@@ -254,7 +269,12 @@ class WalletActivity : Activity() {
         }
 
         if (walletExists()) {
-            showMainWallet()
+            authenticateWallet(
+                title = "Unlock Vexta Wallet",
+                subtitle = "Use biometrics or your device screen lock"
+            ) {
+                showMainWallet()
+            }
         } else {
             showWelcome()
         }
@@ -678,6 +698,39 @@ class WalletActivity : Activity() {
                 Toast.LENGTH_LONG
             ).show()
         }
+    }
+
+    private fun startBackgroundHeaderSyncAndScan() {
+        if (blockchainScanRunning) {
+            return
+        }
+
+        blockchainScanRunning = true
+
+        Thread {
+            try {
+                val chain = HeaderSync.loadCachedChain(this)
+
+                for (peer in listOf("87.106.99.23", "74.208.53.160")) {
+                    try {
+                        val result = HeaderSync.syncFromPeer(peer, chain)
+
+                        if (result.received > 0) {
+                            HeaderSync.saveChain(this, chain)
+                        }
+                    } catch (_: Exception) {
+                    }
+                }
+
+                runOnUiThread {
+                    runBlockchainScan()
+                }
+            } catch (_: Exception) {
+                runOnUiThread {
+                    blockchainScanRunning = false
+                }
+            }
+        }.start()
     }
 
     private fun startHeaderSyncAndScan() {
@@ -1878,8 +1931,12 @@ class WalletActivity : Activity() {
                         return@primaryButton
                     }
 
-                    try {
-                        val words = loadMnemonic()
+                    authenticateWallet(
+                        title = "Authorize payment",
+                        subtitle = "Authenticate before signing this VTX transaction"
+                    ) {
+                        try {
+                            val words = loadMnemonic()
                             .trim()
                             .split(Regex("\\s+"))
 
@@ -2093,6 +2150,7 @@ class WalletActivity : Activity() {
                                 ),
                             Toast.LENGTH_LONG
                         ).show()
+                        }
                     }
                 })
             }
@@ -2226,6 +2284,93 @@ class WalletActivity : Activity() {
         }
     }
 
+    private fun authenticateWallet(
+        title: String,
+        subtitle: String,
+        onSuccess: () -> Unit
+    ) {
+        val authenticators =
+            BiometricManager.Authenticators.BIOMETRIC_WEAK or
+                BiometricManager.Authenticators.DEVICE_CREDENTIAL
+
+        val biometricManager = BiometricManager.from(this)
+
+        if (
+            biometricManager.canAuthenticate(authenticators) !=
+            BiometricManager.BIOMETRIC_SUCCESS
+        ) {
+            AlertDialog.Builder(this)
+                .setTitle("Device security required")
+                .setMessage(
+                    "Vexta Wallet requires biometrics or a device " +
+                        "PIN, pattern, or password. Configure a screen " +
+                        "lock in Android security settings and try again."
+                )
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Security settings") { _, _ ->
+                    startActivity(
+                        Intent(Settings.ACTION_SECURITY_SETTINGS)
+                    )
+                }
+                .show()
+            return
+        }
+
+        val executor = ContextCompat.getMainExecutor(this)
+
+        val prompt = BiometricPrompt(
+            this,
+            executor,
+            object : BiometricPrompt.AuthenticationCallback() {
+                override fun onAuthenticationSucceeded(
+                    result: BiometricPrompt.AuthenticationResult
+                ) {
+                    super.onAuthenticationSucceeded(result)
+                    onSuccess()
+                }
+
+                override fun onAuthenticationFailed() {
+                    super.onAuthenticationFailed()
+
+                    Toast.makeText(
+                        this@WalletActivity,
+                        "Authentication not recognized",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+
+                override fun onAuthenticationError(
+                    errorCode: Int,
+                    errString: CharSequence
+                ) {
+                    super.onAuthenticationError(
+                        errorCode,
+                        errString
+                    )
+
+                    if (
+                        errorCode != BiometricPrompt.ERROR_USER_CANCELED &&
+                        errorCode != BiometricPrompt.ERROR_NEGATIVE_BUTTON
+                    ) {
+                        Toast.makeText(
+                            this@WalletActivity,
+                            errString,
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        )
+
+        val promptInfo = BiometricPrompt.PromptInfo.Builder()
+            .setTitle(title)
+            .setSubtitle(subtitle)
+            .setAllowedAuthenticators(authenticators)
+            .build()
+
+        prompt.authenticate(promptInfo)
+    }
+
     private fun confirmShowSeed() {
         AlertDialog.Builder(this)
             .setTitle("Security warning")
@@ -2234,9 +2379,14 @@ class WalletActivity : Activity() {
                     "Make sure nobody can see your screen."
             )
             .setNegativeButton("Cancel", null)
-            .setPositiveButton("Show") { _, _ ->
-                val words = loadMnemonic().split(" ")
-                showSeedBackup(words)
+            .setPositiveButton("Authenticate") { _, _ ->
+                authenticateWallet(
+                    title = "Show recovery phrase",
+                    subtitle = "Authenticate to reveal your recovery phrase"
+                ) {
+                    val words = loadMnemonic().split(" ")
+                    showSeedBackup(words)
+                }
             }
             .show()
     }

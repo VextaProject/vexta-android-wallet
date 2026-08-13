@@ -22,8 +22,8 @@ android {
         applicationId = "org.vextaproject.wallet"
         minSdk = 26
         targetSdk = 36
-        versionCode = 29
-        versionName = "0.5.1"
+        versionCode = 30
+        versionName = "0.6.0"
     }
 
     signingConfigs {
@@ -55,6 +55,8 @@ android {
 }
 
 dependencies {
+    implementation("androidx.biometric:biometric:1.1.0")
+    implementation("androidx.fragment:fragment-ktx:1.8.9")
     implementation("org.bitcoinj:bitcoinj-core:0.16.3")
     implementation("com.google.zxing:core:3.5.3")
     implementation(
