@@ -1044,7 +1044,7 @@ class WalletActivity : FragmentActivity() {
                         100_000_000.0
                 )
 
-                updateIncomingTransactionsAndNotify(mergedTransactions)
+                // Incoming notifications are handled by WalletMonitoringService.
 
                 if (restoreAddressDiscovery) {
                     setCurrentReceiveAddressIndex(
