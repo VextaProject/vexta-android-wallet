@@ -89,6 +89,10 @@ class WalletActivity : FragmentActivity() {
             "last_confirmed_balance"
         private const val PREF_BALANCE_INITIALIZED =
             "balance_notification_initialized"
+        private const val PREF_KNOWN_INCOMING_TXIDS =
+            "known_incoming_txids"
+        private const val PREF_TX_NOTIFICATIONS_INITIALIZED =
+            "tx_notifications_initialized"
         private const val PREF_RECEIVE_ADDRESS_INDEX =
             "receive_address_index"
         private const val PREF_RESTORE_ADDRESS_DISCOVERY =
@@ -429,41 +433,56 @@ class WalletActivity : FragmentActivity() {
         }
     }
 
-    private fun updateBalanceAndNotify(
-        confirmedBalanceSatoshis: Long
+    private fun updateIncomingTransactionsAndNotify(
+        transactions: List<BlockScanner.WalletTransaction>
     ) {
         val preferences =
             getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
+        val incoming =
+            transactions.filter { it.netSatoshis > 0L }
+
+        val currentTxids =
+            incoming.map { it.txid }.toSet()
+
         val initialized = preferences.getBoolean(
-            PREF_BALANCE_INITIALIZED,
+            PREF_TX_NOTIFICATIONS_INITIALIZED,
             false
         )
 
-        val previousBalance = preferences.getLong(
-            PREF_LAST_CONFIRMED_BALANCE,
-            confirmedBalanceSatoshis
-        )
-
-        preferences.edit()
-            .putBoolean(PREF_BALANCE_INITIALIZED, true)
-            .putLong(
-                PREF_LAST_CONFIRMED_BALANCE,
-                confirmedBalanceSatoshis
-            )
-            .apply()
-
-        if (
-            !initialized ||
-            confirmedBalanceSatoshis <= previousBalance
-        ) {
+        if (!initialized) {
+            preferences.edit()
+                .putBoolean(PREF_TX_NOTIFICATIONS_INITIALIZED, true)
+                .putStringSet(
+                    PREF_KNOWN_INCOMING_TXIDS,
+                    currentTxids
+                )
+                .apply()
             return
         }
 
-        val receivedSatoshis =
-            confirmedBalanceSatoshis - previousBalance
+        val knownTxids =
+            preferences.getStringSet(
+                PREF_KNOWN_INCOMING_TXIDS,
+                emptySet()
+            )?.toMutableSet() ?: mutableSetOf()
 
-        showIncomingPaymentNotification(receivedSatoshis)
+        incoming
+            .filter { it.txid !in knownTxids }
+            .sortedBy { it.height }
+            .forEach { transaction ->
+                showIncomingPaymentNotification(
+                    transaction.netSatoshis
+                )
+                knownTxids.add(transaction.txid)
+            }
+
+        preferences.edit()
+            .putStringSet(
+                PREF_KNOWN_INCOMING_TXIDS,
+                knownTxids
+            )
+            .apply()
     }
 
     private fun showIncomingPaymentNotification(
@@ -1025,7 +1044,7 @@ class WalletActivity : FragmentActivity() {
                         100_000_000.0
                 )
 
-                updateBalanceAndNotify(balanceSatoshis)
+                updateIncomingTransactionsAndNotify(mergedTransactions)
 
                 if (restoreAddressDiscovery) {
                     setCurrentReceiveAddressIndex(
