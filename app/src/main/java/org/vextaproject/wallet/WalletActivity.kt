@@ -803,6 +803,8 @@ class WalletActivity : FragmentActivity() {
             try {
                 val chain = HeaderSync.loadCachedChain(this)
 
+                val syncErrors = mutableListOf<String>()
+
                 for (peer in listOf("87.106.99.23", "74.208.53.160")) {
                     try {
                         val result = HeaderSync.syncFromPeer(peer, chain)
@@ -810,8 +812,21 @@ class WalletActivity : FragmentActivity() {
                         if (result.received > 0) {
                             HeaderSync.saveChain(this, chain)
                         }
-                    } catch (_: Exception) {
+                    } catch (e: Exception) {
+                        syncErrors.add(
+                            "$peer: ${e.message ?: e.javaClass.simpleName}"
+                        )
                     }
+                }
+
+                if (chain.last().height <= 0) {
+                    runOnUiThread {
+                        blockchainScanRunning = false
+                        blockchainScanStatus?.text =
+                            "Block-header synchronization failed.\n" +
+                                syncErrors.joinToString("\n")
+                    }
+                    return@Thread
                 }
 
                 runOnUiThread {
