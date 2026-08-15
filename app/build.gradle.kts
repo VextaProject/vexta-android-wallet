@@ -22,8 +22,8 @@ android {
         applicationId = "org.vextaproject.wallet"
         minSdk = 26
         targetSdk = 36
-        versionCode = 35
-        versionName = "0.6.5"
+        versionCode = 34
+        versionName = "0.6.4"
     }
 
     signingConfigs {
