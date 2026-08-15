@@ -148,13 +148,23 @@ class MainActivity : Activity() {
 
                 runOnUiThread {
                     if (intent.getBooleanExtra("sync_only", false)) {
-                        setResult(
-                            RESULT_OK,
-                            android.content.Intent().putExtra(
-                                "verified_height",
-                                chain.last().height
+                        if (chain.last().height > 0) {
+                            setResult(
+                                RESULT_OK,
+                                android.content.Intent().putExtra(
+                                    "verified_height",
+                                    chain.last().height
+                                )
                             )
-                        )
+                        } else {
+                            setResult(
+                                RESULT_CANCELED,
+                                android.content.Intent().putExtra(
+                                    "sync_error",
+                                    results.joinToString("\n\n")
+                                )
+                            )
+                        }
                         finish()
                     } else {
                         status.text =
@@ -317,8 +327,13 @@ class MainActivity : Activity() {
         val buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         val count = readCompactSize(buffer)
 
-        if (count > 2000) {
-            throw IllegalStateException("too many headers: $count")
+        val maximumPossibleHeaders =
+            buffer.remaining() / 81
+
+        if (count < 0 || count > maximumPossibleHeaders) {
+            throw IllegalStateException(
+                "invalid headers count: $count"
+            )
         }
 
         repeat(count) {

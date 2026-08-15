@@ -192,8 +192,13 @@ object HeaderSync {
         val buffer = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
         val count = readCompactSize(buffer)
 
-        if (count > 2000) {
-            throw IllegalStateException("too many headers: $count")
+        val maximumPossibleHeaders =
+            buffer.remaining() / 81
+
+        if (count < 0 || count > maximumPossibleHeaders) {
+            throw IllegalStateException(
+                "invalid headers count: $count"
+            )
         }
 
         repeat(count) {

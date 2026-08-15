@@ -871,8 +871,18 @@ class WalletActivity : FragmentActivity() {
                 runBlockchainScan()
             } else {
                 blockchainScanRunning = false
+
+                val syncError = data?.getStringExtra(
+                    "sync_error"
+                )?.trim()
+
                 blockchainScanStatus?.text =
-                    "Block-header synchronization failed."
+                    if (syncError.isNullOrBlank()) {
+                        "Block-header synchronization failed."
+                    } else {
+                        "Block-header synchronization failed:\n" +
+                            syncError
+                    }
             }
 
             return
