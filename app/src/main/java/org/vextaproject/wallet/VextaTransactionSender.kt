@@ -43,6 +43,39 @@ object VextaTransactionSender {
         val spentOutpoints: Set<String>
     )
 
+    data class MaxSpend(
+        val amount: Long,
+        val fee: Long
+    )
+
+    fun calculateMaxSpend(
+        spendableUtxos: List<BlockScanner.SpendableUtxo>
+    ): MaxSpend {
+        require(spendableUtxos.isNotEmpty()) {
+            "Wallet has no spendable outputs"
+        }
+
+        val total = spendableUtxos.fold(0L) { sum, utxo ->
+            Math.addExact(sum, utxo.value)
+        }
+
+        val fee = estimateFee(
+            inputCount = spendableUtxos.size,
+            outputCount = 1
+        )
+
+        val amount = total - fee
+
+        require(amount > 0L) {
+            "Balance is too small to cover the transaction fee"
+        }
+
+        return MaxSpend(
+            amount = amount,
+            fee = fee
+        )
+    }
+
     fun createAndSign(
         spendableUtxos: List<BlockScanner.SpendableUtxo>,
         recipientAddress: String,
@@ -72,48 +105,65 @@ object VextaTransactionSender {
                 .thenBy { it.outputIndex }
         )
 
+        val maxSpend = calculateMaxSpend(orderedUtxos)
+        val sendingMaximum =
+            amountSatoshis == maxSpend.amount
+
         val selected =
             mutableListOf<BlockScanner.SpendableUtxo>()
 
         var selectedValue = 0L
+        var fee: Long
+        var change: Long
 
-        for (utxo in orderedUtxos) {
-            selected.add(utxo)
-            selectedValue =
-                Math.addExact(selectedValue, utxo.value)
+        if (sendingMaximum) {
+            selected.addAll(orderedUtxos)
 
-            val estimatedFee = estimateFee(
+            selectedValue = selected.fold(0L) { sum, utxo ->
+                Math.addExact(sum, utxo.value)
+            }
+
+            fee = maxSpend.fee
+            change = 0L
+        } else {
+            for (utxo in orderedUtxos) {
+                selected.add(utxo)
+                selectedValue =
+                    Math.addExact(selectedValue, utxo.value)
+
+                val estimatedFee = estimateFee(
+                    inputCount = selected.size,
+                    outputCount = 2
+                )
+
+                if (
+                    selectedValue >=
+                    amountSatoshis + estimatedFee
+                ) {
+                    break
+                }
+            }
+
+            if (selected.isEmpty()) {
+                throw IllegalStateException(
+                    "Wallet has no spendable outputs"
+                )
+            }
+
+            fee = estimateFee(
                 inputCount = selected.size,
                 outputCount = 2
             )
 
-            if (
-                selectedValue >=
-                amountSatoshis + estimatedFee
-            ) {
-                break
+            if (selectedValue < amountSatoshis + fee) {
+                throw IllegalStateException(
+                    "Insufficient balance including transaction fee"
+                )
             }
+
+            change =
+                selectedValue - amountSatoshis - fee
         }
-
-        if (selected.isEmpty()) {
-            throw IllegalStateException(
-                "Wallet has no spendable outputs"
-            )
-        }
-
-        var fee = estimateFee(
-            inputCount = selected.size,
-            outputCount = 2
-        )
-
-        if (selectedValue < amountSatoshis + fee) {
-            throw IllegalStateException(
-                "Insufficient balance including transaction fee"
-            )
-        }
-
-        var change =
-            selectedValue - amountSatoshis - fee
 
         val outputs = mutableListOf(
             TransactionOutputData(
@@ -122,16 +172,18 @@ object VextaTransactionSender {
             )
         )
 
-        if (change >= dustLimit) {
-            outputs.add(
-                TransactionOutputData(
-                    value = change,
-                    script = changeScript
+        if (!sendingMaximum) {
+            if (change >= dustLimit) {
+                outputs.add(
+                    TransactionOutputData(
+                        value = change,
+                        script = changeScript
+                    )
                 )
-            )
-        } else {
-            fee += change
-            change = 0L
+            } else {
+                fee += change
+                change = 0L
+            }
         }
 
         /*

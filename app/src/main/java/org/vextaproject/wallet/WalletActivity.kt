@@ -267,12 +267,6 @@ class WalletActivity : FragmentActivity() {
                     val now = System.currentTimeMillis()
 
                     if (now - lastExitSwipeAt <= 2_000L) {
-                        stopService(
-                            Intent(
-                                this@WalletActivity,
-                                WalletMonitoringService::class.java
-                            )
-                        )
                         finishAndRemoveTask()
                     } else {
                         lastExitSwipeAt = now
@@ -372,12 +366,6 @@ class WalletActivity : FragmentActivity() {
         val now = System.currentTimeMillis()
 
         if (now - lastExitSwipeAt <= 2_000L) {
-            stopService(
-                Intent(
-                    this,
-                    WalletMonitoringService::class.java
-                )
-            )
             finishAndRemoveTask()
         } else {
             lastExitSwipeAt = now
@@ -1404,10 +1392,10 @@ class WalletActivity : FragmentActivity() {
                 addView(sectionTitle("Get started"))
                 addView(space(10))
                 addView(primaryButton("Create new wallet") {
-                    createNewWallet()
+                    showSeedLengthDialog()
                 })
                 addView(space(12))
-                addView(secondaryButton("Restore from 12 words") {
+                addView(secondaryButton("Restore wallet") {
                     showRestoreDialog()
                 })
             }
@@ -1416,11 +1404,59 @@ class WalletActivity : FragmentActivity() {
         setContentView(scroll(content))
     }
 
-    private fun createNewWallet() {
-        val entropy = ByteArray(16)
+    private fun showSeedLengthDialog() {
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(
+                dp(20),
+                dp(8),
+                dp(20),
+                dp(4)
+            )
+
+            addView(
+                primaryButton("12-word recovery phrase") {
+                    createNewWallet(12)
+                }
+            )
+
+            addView(space(12))
+
+            addView(
+                primaryButton("24-word recovery phrase") {
+                    createNewWallet(24)
+                }
+            )
+        }
+
+        AlertDialog.Builder(this)
+            .setTitle("Recovery phrase length")
+            .setMessage(
+                "Choose the recovery phrase length for your new wallet."
+            )
+            .setView(content)
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun createNewWallet(wordCount: Int) {
+        val entropyBytes = when (wordCount) {
+            12 -> 16
+            24 -> 32
+            else -> throw IllegalArgumentException(
+                "Unsupported recovery phrase length"
+            )
+        }
+
+        val entropy = ByteArray(entropyBytes)
         SecureRandom().nextBytes(entropy)
 
         val words = MnemonicCode.INSTANCE.toMnemonic(entropy)
+
+        require(words.size == wordCount) {
+            "Unexpected recovery phrase length"
+        }
+
         saveMnemonic(words.joinToString(" "))
 
         getSharedPreferences(PREFS, MODE_PRIVATE)
@@ -1441,7 +1477,7 @@ class WalletActivity : FragmentActivity() {
         content.addView(title("Recovery phrase"))
         content.addView(
             subtitle(
-                "Write these 12 words down in the correct order.\n" +
+                "Write these ${words.size} words down in the correct order.\n" +
                     "Anyone with these words can control your VTX."
             )
         )
@@ -1449,7 +1485,7 @@ class WalletActivity : FragmentActivity() {
 
         content.addView(
             card {
-                addView(sectionTitle("Your 12 words"))
+                addView(sectionTitle("Your ${words.size} words"))
                 addView(space(14))
 
                 addView(
@@ -1674,12 +1710,6 @@ class WalletActivity : FragmentActivity() {
                 val now = System.currentTimeMillis()
 
                 if (now - lastExitSwipeAt <= 2_000L) {
-                    stopService(
-                        Intent(
-                            this,
-                            WalletMonitoringService::class.java
-                        )
-                    )
                     finishAndRemoveTask()
                 } else {
                     lastExitSwipeAt = now
@@ -2005,6 +2035,80 @@ class WalletActivity : FragmentActivity() {
 
                 addView(space(12))
                 addView(amountInput)
+                addView(space(10))
+
+                val availableSatoshis =
+                    latestSpendableUtxos.sumOf { it.value }
+
+                addView(
+                    smallStatus(
+                        "Available: " +
+                            String.format(
+                                java.util.Locale.US,
+                                "%.8f VTX",
+                                availableSatoshis.toDouble() /
+                                    100_000_000.0
+                            ) +
+                            "\nNetwork fee is shown before sending."
+                    )
+                )
+
+                addView(space(10))
+
+                addView(
+                    secondaryButton("Send Max") {
+                        try {
+                            val maxSpend =
+                                VextaTransactionSender.calculateMaxSpend(
+                                    latestSpendableUtxos
+                                )
+
+                            amountInput.setText(
+                                String.format(
+                                    java.util.Locale.US,
+                                    "%.8f",
+                                    maxSpend.amount.toDouble() /
+                                        100_000_000.0
+                                )
+                            )
+
+                            noteView.text =
+                                "Send Max selected\n" +
+                                    "Available: " +
+                                    String.format(
+                                        java.util.Locale.US,
+                                        "%.8f VTX",
+                                        (
+                                            maxSpend.amount +
+                                                maxSpend.fee
+                                        ).toDouble() /
+                                            100_000_000.0
+                                    ) +
+                                    "\nNetwork fee: " +
+                                    String.format(
+                                        java.util.Locale.US,
+                                        "%.8f VTX",
+                                        maxSpend.fee.toDouble() /
+                                            100_000_000.0
+                                    ) +
+                                    "\nSending: " +
+                                    String.format(
+                                        java.util.Locale.US,
+                                        "%.8f VTX",
+                                        maxSpend.amount.toDouble() /
+                                            100_000_000.0
+                                    )
+                        } catch (error: Exception) {
+                            Toast.makeText(
+                                this@WalletActivity,
+                                error.message
+                                    ?: "Unable to calculate maximum amount",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                )
+
                 addView(space(14))
                 addView(primaryButton("Review payment") {
                     if (sendInProgress) {
@@ -2355,7 +2459,7 @@ class WalletActivity : FragmentActivity() {
 
     private fun showRestoreDialog() {
         val input = EditText(this).apply {
-            hint = "Enter the 12 recovery words"
+            hint = "Enter your 12 or 24 recovery words"
             minLines = 5
             gravity = Gravity.TOP
             setTextColor(textPrimary)
@@ -2370,7 +2474,9 @@ class WalletActivity : FragmentActivity() {
 
         AlertDialog.Builder(this)
             .setTitle("Restore Vexta Wallet")
-            .setMessage("Enter all 12 words separated by spaces.")
+            .setMessage(
+                "Enter all 12 or 24 recovery words separated by spaces."
+            )
             .setView(input)
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Restore") { _, _ ->
@@ -2387,8 +2493,10 @@ class WalletActivity : FragmentActivity() {
                 .split(Regex("\\s+"))
                 .filter { it.isNotBlank() }
 
-            if (words.size != 12) {
-                throw IllegalArgumentException("Exactly 12 words are required")
+            if (words.size != 12 && words.size != 24) {
+                throw IllegalArgumentException(
+                    "Recovery phrase must contain 12 or 24 words"
+                )
             }
 
             MnemonicCode.INSTANCE.check(words)
@@ -2527,7 +2635,7 @@ class WalletActivity : FragmentActivity() {
             .setTitle("Delete wallet?")
             .setMessage(
                 "This removes the encrypted seed from this phone. " +
-                    "The wallet can only be recovered with its 12 words."
+                    "The wallet can only be recovered with its recovery phrase."
             )
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Delete") { _, _ ->
