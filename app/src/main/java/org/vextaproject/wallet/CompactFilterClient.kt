@@ -128,6 +128,7 @@ object CompactFilterClient {
         context: Context,
         peer: String,
         scriptPubKey: ByteArray,
+        startHeight: Int = 1,
         progress: (Int, Int) -> Unit
     ): ScanResult {
         val headerHashes = loadHeaderHashes(context)
@@ -151,7 +152,8 @@ object CompactFilterClient {
             var compactFiltersAvailable = false
             var gotVersion = false
             var gotVerack = false
-            var nextHeight = 1
+            var nextHeight =
+                startHeight.coerceIn(1, localHeight)
             var requestedEndHeight = 0
             var receivedInBatch = 0
             var totalScanned = 0
@@ -239,7 +241,7 @@ object CompactFilterClient {
                     requestedEndHeight == 0
                 ) {
                     requestedEndHeight = minOf(
-                        maxFiltersPerRequest,
+                        nextHeight + maxFiltersPerRequest - 1,
                         localHeight
                     )
 

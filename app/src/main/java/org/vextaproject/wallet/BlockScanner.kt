@@ -34,7 +34,11 @@ object BlockScanner {
     data class WalletTransaction(
         val txid: String,
         val height: Int,
-        val netSatoshis: Long
+        val netSatoshis: Long,
+        val blockTime: Long,
+        val isPending: Boolean = false,
+        val feeSatoshis: Long? = null,
+        val recipientAddress: String? = null
     )
 
     data class Result(
@@ -78,16 +82,26 @@ object BlockScanner {
         matchingHeights: List<Int>,
         walletScript: ByteArray,
         addressIndex: Int,
+        initialUtxos: List<SpendableUtxo> = emptyList(),
         progress: (Int, Int) -> Unit
     ): Result {
         if (matchingHeights.isEmpty()) {
+            val existing =
+                initialUtxos
+                    .filter { it.addressIndex == addressIndex }
+                    .sortedWith(
+                        compareBy<SpendableUtxo> { it.height }
+                            .thenBy { it.txid }
+                            .thenBy { it.outputIndex }
+                    )
+
             return Result(
                 downloadedBlocks = 0,
                 receivedTransactions = 0,
                 spentTransactions = 0,
-                utxoCount = 0,
-                balanceSatoshis = 0,
-                utxos = emptyList(),
+                utxoCount = existing.size,
+                balanceSatoshis = existing.sumOf { it.value },
+                utxos = existing,
                 transactions = emptyList()
             )
         }
@@ -108,6 +122,26 @@ object BlockScanner {
         }
 
         val utxos = linkedMapOf<String, Utxo>()
+
+        initialUtxos
+            .filter { it.addressIndex == addressIndex }
+            .forEach { existing ->
+                val txidWire =
+                    existing.txid
+                        .chunked(2)
+                        .map { it.toInt(16).toByte() }
+                        .toByteArray()
+                        .reversedArray()
+
+                utxos[outPointKey(txidWire, existing.outputIndex)] =
+                    Utxo(
+                        txidWire = txidWire,
+                        outputIndex = existing.outputIndex,
+                        value = existing.value,
+                        height = existing.height,
+                        addressIndex = existing.addressIndex
+                    )
+            }
         var receivedTransactions = 0
         var spentTransactions = 0
         var downloadedBlocks = 0
@@ -145,6 +179,17 @@ object BlockScanner {
                         }
 
                         val blockHeader = payload.copyOfRange(0, 80)
+
+                        val blockTime =
+                            ByteBuffer.wrap(
+                                blockHeader,
+                                68,
+                                4
+                            )
+                                .order(ByteOrder.LITTLE_ENDIAN)
+                                .int
+                                .toLong() and 0xffffffffL
+
                         val blockHashWire = doubleSha256(blockHeader)
                         val height = heightByHash[blockHashWire.toHex()]
                             ?: throw IllegalStateException(
@@ -212,7 +257,8 @@ object BlockScanner {
                                             .reversedArray()
                                             .toHex(),
                                         height = height,
-                                        netSatoshis = netSatoshis
+                                        netSatoshis = netSatoshis,
+                                        blockTime = blockTime
                                     )
                                 )
                             }

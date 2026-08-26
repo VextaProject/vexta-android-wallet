@@ -41,6 +41,15 @@ class WalletMonitoringService : Service() {
             "known_incoming_txids"
         private const val PREF_TX_NOTIFICATIONS_INITIALIZED =
             "tx_notifications_initialized"
+        private const val PREF_LAST_BACKGROUND_SCAN_HEIGHT =
+            "last_background_scan_height"
+        private const val PREF_BACKGROUND_UTXO_PREFIX =
+            "background_utxos_"
+        private const val PREF_BACKGROUND_TX_HISTORY =
+            "background_transaction_history"
+        private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
+            "background_transaction_history_version"
+        private const val BACKGROUND_TX_HISTORY_VERSION = 1
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -103,13 +112,63 @@ class WalletMonitoringService : Service() {
                     .trim()
                     .split(Regex("\\s+"))
 
-                val highestAddressIndex =
+                val preferences =
                     getSharedPreferences(PREFS, MODE_PRIVATE)
+
+                val highestAddressIndex =
+                    preferences
                         .getInt(PREF_RECEIVE_ADDRESS_INDEX, 0)
                         .coerceAtLeast(0)
 
+                val localHeight = chain.last().height
+
+                val previousHeight =
+                    preferences
+                        .getInt(
+                            PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                            0
+                        )
+                        .coerceAtLeast(0)
+
+                val backgroundCacheAvailable =
+                    (0..highestAddressIndex).all { addressIndex ->
+                        preferences.contains(
+                            PREF_BACKGROUND_UTXO_PREFIX +
+                                addressIndex
+                        )
+                    }
+
+                val transactionHistoryCurrent =
+                    preferences.getInt(
+                        PREF_BACKGROUND_TX_HISTORY_VERSION,
+                        0
+                    ) == BACKGROUND_TX_HISTORY_VERSION
+
+                val fullScanRequired =
+                    previousHeight <= 0 ||
+                        previousHeight > localHeight ||
+                        !backgroundCacheAvailable ||
+                        !transactionHistoryCurrent
+
+                if (
+                    !fullScanRequired &&
+                    previousHeight == localHeight
+                ) {
+                    return@Thread
+                }
+
+                val startHeight =
+                    if (fullScanRequired) {
+                        1
+                    } else {
+                        previousHeight + 1
+                    }
+
                 val allTransactions =
                     mutableListOf<BlockScanner.WalletTransaction>()
+
+                val updatedUtxos =
+                    linkedMapOf<Int, List<BlockScanner.SpendableUtxo>>()
 
                 for (addressIndex in 0..highestAddressIndex) {
                     val script =
@@ -119,8 +178,19 @@ class WalletMonitoringService : Service() {
                         CompactFilterClient.scan(
                             this,
                             "87.106.99.23",
-                            script
+                            script,
+                            startHeight = startHeight
                         ) { _, _ -> }
+
+                    val initialUtxos =
+                        if (fullScanRequired) {
+                            emptyList()
+                        } else {
+                            loadBackgroundUtxos(
+                                preferences,
+                                addressIndex
+                            )
+                        }
 
                     val blocks =
                         BlockScanner.scan(
@@ -128,24 +198,32 @@ class WalletMonitoringService : Service() {
                             "87.106.99.23",
                             filters.matchingHeights,
                             script,
-                            addressIndex
+                            addressIndex,
+                            initialUtxos = initialUtxos
                         ) { _, _ -> }
 
                     allTransactions.addAll(blocks.transactions)
+
+                    updatedUtxos[addressIndex] =
+                        blocks.utxos
                 }
 
                 val mergedTransactions =
                     allTransactions
                         .groupBy { it.txid }
                         .map { (_, transactions) ->
-                            BlockScanner.WalletTransaction(
-                                txid = transactions.first().txid,
-                                height = transactions.maxOf {
+                            val newest =
+                                transactions.maxByOrNull {
                                     it.height
-                                },
+                                } ?: transactions.first()
+
+                            BlockScanner.WalletTransaction(
+                                txid = newest.txid,
+                                height = newest.height,
                                 netSatoshis = transactions.sumOf {
                                     it.netSatoshis
-                                }
+                                },
+                                blockTime = newest.blockTime
                             )
                         }
                         .filter { it.netSatoshis != 0L }
@@ -153,11 +231,105 @@ class WalletMonitoringService : Service() {
                 updateIncomingTransactionsAndNotify(
                     mergedTransactions
                 )
+
+                val cachedTransactions =
+                    if (fullScanRequired) {
+                        mergedTransactions
+                    } else {
+                        (
+                            loadBackgroundTransactions(preferences) +
+                                mergedTransactions
+                        )
+                            .groupBy { it.txid }
+                            .map { (_, transactions) ->
+                                transactions.maxByOrNull {
+                                    it.height
+                                } ?: transactions.first()
+                            }
+                    }
+                        .sortedByDescending {
+                            it.blockTime
+                        }
+
+                val editor = preferences.edit()
+
+                editor.putStringSet(
+                    PREF_BACKGROUND_TX_HISTORY,
+                    encodeBackgroundTransactions(
+                        cachedTransactions
+                    )
+                )
+
+                for (
+                    addressIndex in 0..highestAddressIndex
+                ) {
+                    editor.putStringSet(
+                        PREF_BACKGROUND_UTXO_PREFIX +
+                            addressIndex,
+                        encodeBackgroundUtxos(
+                            updatedUtxos[addressIndex]
+                                ?: emptyList()
+                        )
+                    )
+                }
+
+                editor.putInt(
+                    PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                    localHeight
+                )
+
+                editor.putInt(
+                    PREF_BACKGROUND_TX_HISTORY_VERSION,
+                    BACKGROUND_TX_HISTORY_VERSION
+                )
+
+                editor.apply()
             } catch (_: Exception) {
             } finally {
                 scanRunning = false
             }
         }.start()
+    }
+
+    private fun encodeBackgroundTransactions(
+        transactions: List<BlockScanner.WalletTransaction>
+    ): Set<String> =
+        transactions.map { transaction ->
+            listOf(
+                transaction.txid,
+                transaction.height.toString(),
+                transaction.netSatoshis.toString(),
+                transaction.blockTime.toString()
+            ).joinToString("|")
+        }.toSet()
+
+    private fun loadBackgroundTransactions(
+        preferences: android.content.SharedPreferences
+    ): List<BlockScanner.WalletTransaction> {
+        val values =
+            preferences.getStringSet(
+                PREF_BACKGROUND_TX_HISTORY,
+                emptySet()
+            ) ?: emptySet()
+
+        return values.mapNotNull { value ->
+            try {
+                val parts = value.split("|")
+
+                if (parts.size != 4) {
+                    return@mapNotNull null
+                }
+
+                BlockScanner.WalletTransaction(
+                    txid = parts[0],
+                    height = parts[1].toInt(),
+                    netSatoshis = parts[2].toLong(),
+                    blockTime = parts[3].toLong()
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     private fun updateIncomingTransactionsAndNotify(
@@ -277,6 +449,50 @@ class WalletMonitoringService : Service() {
             (System.currentTimeMillis() and 0x7fffffff).toInt(),
             notification
         )
+    }
+
+    private fun encodeBackgroundUtxos(
+        utxos: List<BlockScanner.SpendableUtxo>
+    ): Set<String> =
+        utxos.map { utxo ->
+            listOf(
+                utxo.txid,
+                utxo.outputIndex.toString(),
+                utxo.value.toString(),
+                utxo.height.toString(),
+                utxo.addressIndex.toString()
+            ).joinToString("|")
+        }.toSet()
+
+    private fun loadBackgroundUtxos(
+        preferences: android.content.SharedPreferences,
+        addressIndex: Int
+    ): List<BlockScanner.SpendableUtxo> {
+        val values =
+            preferences.getStringSet(
+                PREF_BACKGROUND_UTXO_PREFIX + addressIndex,
+                emptySet()
+            ) ?: emptySet()
+
+        return values.mapNotNull { value ->
+            try {
+                val parts = value.split("|")
+
+                if (parts.size != 5) {
+                    return@mapNotNull null
+                }
+
+                BlockScanner.SpendableUtxo(
+                    txid = parts[0],
+                    outputIndex = parts[1].toLong(),
+                    value = parts[2].toLong(),
+                    height = parts[3].toInt(),
+                    addressIndex = parts[4].toInt()
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
     }
 
     private fun walletExists(): Boolean {

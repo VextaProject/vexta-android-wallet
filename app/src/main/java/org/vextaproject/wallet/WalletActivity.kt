@@ -95,9 +95,25 @@ class WalletActivity : FragmentActivity() {
             "tx_notifications_initialized"
         private const val PREF_RECEIVE_ADDRESS_INDEX =
             "receive_address_index"
+        private const val PREF_ADDRESS_LABEL_PREFIX =
+            "receive_address_label_"
         private const val PREF_RESTORE_ADDRESS_DISCOVERY =
             "restore_address_discovery"
         private const val RESTORE_ADDRESS_LOOKAHEAD = 20
+        private const val PREF_OUTGOING_TRANSACTIONS =
+            "outgoing_transactions"
+        private const val PREF_BACKGROUND_UTXO_PREFIX =
+            "background_utxos_"
+        private const val PREF_BACKGROUND_TX_HISTORY =
+            "background_transaction_history"
+        private const val PREF_LAST_BACKGROUND_SCAN_HEIGHT =
+            "last_background_scan_height"
+
+        private const val CONTACT_PREFS =
+            "vexta_wallet_contacts"
+
+        private const val PREF_CONTACTS_JSON =
+            "contacts_json"
     }
 
     private val backgroundColor = Color.rgb(2, 8, 23)
@@ -126,6 +142,21 @@ class WalletActivity : FragmentActivity() {
     private var lastExitSwipeAt = 0L
     private var latestSpendableUtxos =
         emptyList<BlockScanner.SpendableUtxo>()
+    private var latestChainHeight = 0
+
+    private data class OutgoingTransactionRecord(
+        val txid: String,
+        val amountSatoshis: Long,
+        val feeSatoshis: Long,
+        val recipientAddress: String,
+        val sentTime: Long
+    )
+
+    private data class WalletContact(
+        val id: String,
+        val name: String,
+        val address: String
+    )
 
     private val refreshHandler = Handler(Looper.getMainLooper())
 
@@ -135,13 +166,37 @@ class WalletActivity : FragmentActivity() {
                 !isFinishing &&
                 !isDestroyed &&
                 walletExists() &&
-                !blockchainScanRunning
+                mainWalletVisible
             ) {
-                if (hasWindowFocus()) {
-                    startHeaderSyncAndScan()
-                } else {
-                    startBackgroundHeaderSyncAndScan()
-                }
+                val cachedUtxos =
+                    loadCachedWalletUtxos()
+
+                val cachedTransactions =
+                    loadCachedWalletTransactions()
+
+                latestSpendableUtxos = cachedUtxos
+                latestWalletTransactions =
+                    cachedTransactions
+
+                val balanceSatoshis =
+                    cachedUtxos.sumOf { it.value }
+
+                walletBalanceView?.text =
+                    String.format(
+                        "%.8f VTX",
+                        balanceSatoshis.toDouble() /
+                            100_000_000.0
+                    )
+
+                walletHistoryView?.text =
+                    formatTransactionHistory(
+                        cachedTransactions,
+                        limit = 3,
+                        showFullTxid = false
+                    )
+
+                blockchainScanStatus?.text =
+                    "Wallet ready — background synchronization active"
             }
 
             refreshHandler.postDelayed(this, 60_000L)
@@ -894,6 +949,169 @@ class WalletActivity : FragmentActivity() {
         super.onActivityResult(requestCode, resultCode, data)
     }
 
+    private fun addressLabel(index: Int): String {
+        return getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(
+                PREF_ADDRESS_LABEL_PREFIX + index,
+                ""
+            )
+            ?.trim()
+            .orEmpty()
+    }
+
+    private fun setAddressLabel(
+        index: Int,
+        label: String
+    ) {
+        val editor =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .edit()
+
+        val value = label.trim()
+
+        if (value.isBlank()) {
+            editor.remove(
+                PREF_ADDRESS_LABEL_PREFIX + index
+            )
+        } else {
+            editor.putString(
+                PREF_ADDRESS_LABEL_PREFIX + index,
+                value
+            )
+        }
+
+        editor.apply()
+    }
+
+    private fun loadCachedWalletUtxos(): List<BlockScanner.SpendableUtxo> {
+        val preferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        val highestIndex = currentReceiveAddressIndex()
+
+        return (0..highestIndex)
+            .flatMap { addressIndex ->
+                val values =
+                    preferences.getStringSet(
+                        PREF_BACKGROUND_UTXO_PREFIX + addressIndex,
+                        emptySet()
+                    ) ?: emptySet()
+
+                values.mapNotNull { value ->
+                    try {
+                        val parts = value.split("|")
+
+                        if (parts.size != 5) {
+                            return@mapNotNull null
+                        }
+
+                        BlockScanner.SpendableUtxo(
+                            txid = parts[0],
+                            outputIndex = parts[1].toLong(),
+                            value = parts[2].toLong(),
+                            height = parts[3].toInt(),
+                            addressIndex = parts[4].toInt()
+                        )
+                    } catch (_: Exception) {
+                        null
+                    }
+                }
+            }
+            .distinctBy {
+                "${it.txid}:${it.outputIndex}"
+            }
+    }
+
+    private fun loadCachedWalletTransactions():
+        List<BlockScanner.WalletTransaction> {
+
+        val preferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        val outgoingByTxid =
+            loadOutgoingTransactionRecords(preferences)
+                .associateBy { it.txid }
+
+        val values =
+            preferences.getStringSet(
+                PREF_BACKGROUND_TX_HISTORY,
+                emptySet()
+            ) ?: emptySet()
+
+        val confirmed =
+            values.mapNotNull { value ->
+                try {
+                    val parts = value.split("|")
+
+                    if (parts.size != 4) {
+                        return@mapNotNull null
+                    }
+
+                    val txid = parts[0]
+                    val outgoing = outgoingByTxid[txid]
+
+                    BlockScanner.WalletTransaction(
+                        txid = txid,
+                        height = parts[1].toInt(),
+                        netSatoshis =
+                            if (outgoing != null) {
+                                -outgoing.amountSatoshis
+                            } else {
+                                parts[2].toLong()
+                            },
+                        blockTime = parts[3].toLong(),
+                        feeSatoshis = outgoing?.feeSatoshis,
+                        recipientAddress =
+                            outgoing?.recipientAddress
+                    )
+                } catch (_: Exception) {
+                    null
+                }
+            }
+
+        val confirmedTxids =
+            confirmed.map { it.txid }.toSet()
+
+        val pending =
+            loadOutgoingTransactionRecords(preferences)
+                .filter { it.txid !in confirmedTxids }
+                .map { outgoing ->
+                    BlockScanner.WalletTransaction(
+                        txid = outgoing.txid,
+                        height = 0,
+                        netSatoshis =
+                            -outgoing.amountSatoshis,
+                        blockTime = outgoing.sentTime,
+                        isPending = true,
+                        feeSatoshis =
+                            outgoing.feeSatoshis,
+                        recipientAddress =
+                            outgoing.recipientAddress
+                    )
+                }
+
+        return (pending + confirmed)
+            .sortedWith(
+                compareByDescending<
+                    BlockScanner.WalletTransaction
+                > {
+                    if (it.isPending) {
+                        Long.MAX_VALUE
+                    } else {
+                        it.blockTime
+                    }
+                }
+            )
+    }
+
+    private fun hasCachedWalletState(): Boolean {
+        return getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getInt(
+                PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                0
+            ) > 0
+    }
+
     private fun currentReceiveAddressIndex(): Int {
         return getSharedPreferences(PREFS, MODE_PRIVATE)
             .getInt(PREF_RECEIVE_ADDRESS_INDEX, 0)
@@ -971,6 +1189,12 @@ class WalletActivity : FragmentActivity() {
                     totalFiltersScanned +=
                         filterResult.scannedFilters
 
+                    latestChainHeight =
+                        maxOf(
+                            latestChainHeight,
+                            filterResult.localHeaderHeight
+                        )
+
                     val blockResult = BlockScanner.scan(
                         this@WalletActivity,
                         "87.106.99.23",
@@ -1008,26 +1232,79 @@ class WalletActivity : FragmentActivity() {
                         blockResult.spentTransactions
                 }
 
-                val mergedTransactions =
+                val outgoingRecords =
+                    loadOutgoingTransactionRecords(preferences)
+
+                val outgoingByTxid =
+                    outgoingRecords.associateBy { it.txid }
+
+                val confirmedTransactions =
                     allTransactions
                         .groupBy { it.txid }
                         .map { (_, transactions) ->
-                            BlockScanner.WalletTransaction(
-                                txid = transactions.first().txid,
-                                height = transactions.maxOf {
+                            val newest =
+                                transactions.maxByOrNull {
                                     it.height
-                                },
-                                netSatoshis = transactions.sumOf {
-                                    it.netSatoshis
-                                }
+                                } ?: transactions.first()
+
+                            val outgoing =
+                                outgoingByTxid[newest.txid]
+
+                            BlockScanner.WalletTransaction(
+                                txid = newest.txid,
+                                height = newest.height,
+                                netSatoshis =
+                                    if (outgoing != null) {
+                                        -outgoing.amountSatoshis
+                                    } else {
+                                        transactions.sumOf {
+                                            it.netSatoshis
+                                        }
+                                    },
+                                blockTime = newest.blockTime,
+                                feeSatoshis =
+                                    outgoing?.feeSatoshis,
+                                recipientAddress =
+                                    outgoing?.recipientAddress
                             )
                         }
                         .filter { it.netSatoshis != 0L }
+
+                val confirmedTxids =
+                    confirmedTransactions
+                        .map { it.txid }
+                        .toSet()
+
+                val pendingTransactions =
+                    outgoingRecords
+                        .filter { it.txid !in confirmedTxids }
+                        .map { outgoing ->
+                            BlockScanner.WalletTransaction(
+                                txid = outgoing.txid,
+                                height = 0,
+                                netSatoshis =
+                                    -outgoing.amountSatoshis,
+                                blockTime =
+                                    outgoing.sentTime,
+                                isPending = true,
+                                feeSatoshis =
+                                    outgoing.feeSatoshis,
+                                recipientAddress =
+                                    outgoing.recipientAddress
+                            )
+                        }
+
+                val mergedTransactions =
+                    (pendingTransactions + confirmedTransactions)
                         .sortedWith(
                             compareByDescending<
                                 BlockScanner.WalletTransaction
                             > {
-                                it.height
+                                if (it.isPending) {
+                                    Long.MAX_VALUE
+                                } else {
+                                    it.blockTime
+                                }
                             }.thenByDescending {
                                 it.txid
                             }
@@ -1150,10 +1427,156 @@ class WalletActivity : FragmentActivity() {
                             transaction.txid.takeLast(12)
                     }
 
+                val dateTime =
+                    java.text.SimpleDateFormat(
+                        "dd/MM/yyyy HH:mm:ss",
+                        java.util.Locale.getDefault()
+                    ).format(
+                        java.util.Date(
+                            transaction.blockTime * 1000L
+                        )
+                    )
+
+                val statusText =
+                    if (transaction.isPending) {
+                        "Pending\nConfirmations: 0"
+                    } else {
+                        val confirmations =
+                            (
+                                latestChainHeight -
+                                    transaction.height +
+                                    1
+                            ).coerceAtLeast(1)
+
+                        "Block ${transaction.height}\n" +
+                            "Confirmations: $confirmations"
+                    }
+
                 "$direction  $sign$amount VTX\n" +
-                    "Block ${transaction.height}\n" +
+                    "$dateTime\n" +
+                    "$statusText\n" +
                     txidText
             }
+    }
+
+    private fun showTransactionDetail(
+        transaction: BlockScanner.WalletTransaction
+    ) {
+        val received = transaction.netSatoshis > 0L
+
+        val direction =
+            if (received) "Received" else "Sent"
+
+        val amount =
+            String.format(
+                java.util.Locale.US,
+                "%.8f",
+                kotlin.math.abs(
+                    transaction.netSatoshis
+                ).toDouble() / 100_000_000.0
+            )
+
+        val dateTime =
+            java.text.SimpleDateFormat(
+                "dd/MM/yyyy HH:mm:ss",
+                java.util.Locale.getDefault()
+            ).format(
+                java.util.Date(
+                    transaction.blockTime * 1000L
+                )
+            )
+
+        val confirmations =
+            if (transaction.isPending) {
+                0
+            } else {
+                (
+                    latestChainHeight -
+                        transaction.height +
+                        1
+                ).coerceAtLeast(1)
+            }
+
+        val details = StringBuilder()
+
+        details.append("Type: $direction\n")
+        details.append("Amount: $amount VTX\n")
+        details.append("Date & time: $dateTime\n")
+
+        if (transaction.isPending) {
+            details.append("Status: Pending\n")
+            details.append("Confirmations: 0\n")
+        } else {
+            details.append("Status: Confirmed\n")
+            details.append("Block: ${transaction.height}\n")
+            details.append("Confirmations: $confirmations\n")
+        }
+
+        transaction.feeSatoshis?.let { fee ->
+            details.append(
+                "Network fee: " +
+                    String.format(
+                        java.util.Locale.US,
+                        "%.8f VTX",
+                        fee.toDouble() / 100_000_000.0
+                    ) +
+                    "\n"
+            )
+        }
+
+        transaction.recipientAddress?.let { recipient ->
+            details.append("Recipient:\n$recipient\n")
+        }
+
+        details.append("TXID:\n${transaction.txid}")
+
+        AlertDialog.Builder(this)
+            .setTitle("Transaction details")
+            .setMessage(details.toString())
+            .setNegativeButton("Close", null)
+            .setNeutralButton("Copy TXID") { _, _ ->
+                val clipboard =
+                    getSystemService(
+                        Context.CLIPBOARD_SERVICE
+                    ) as ClipboardManager
+
+                clipboard.setPrimaryClip(
+                    ClipData.newPlainText(
+                        "Vexta transaction ID",
+                        transaction.txid
+                    )
+                )
+
+                Toast.makeText(
+                    this,
+                    "TXID copied",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+            .setPositiveButton("View in Explorer") { _, _ ->
+                val url =
+                    "https://vextaproject.org/explorer/" +
+                        "?view=tx&id=" +
+                        android.net.Uri.encode(
+                            transaction.txid
+                        )
+
+                try {
+                    startActivity(
+                        Intent(
+                            Intent.ACTION_VIEW,
+                            Uri.parse(url)
+                        )
+                    )
+                } catch (error: Exception) {
+                    Toast.makeText(
+                        this,
+                        "Unable to open explorer",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
+            .show()
     }
 
     private fun showTransactionHistory() {
@@ -1279,18 +1702,58 @@ class WalletActivity : FragmentActivity() {
                 )
                 addView(space(10))
 
-                addView(
-                    smallStatus(
-                        formatTransactionHistory(
-                            displayedTransactions,
-                            limit = displayedTransactions.size,
-                            showFullTxid = true
+                if (displayedTransactions.isEmpty()) {
+                    addView(
+                        smallStatus(
+                            "No transactions found"
                         )
-                    ).apply {
-                        gravity = Gravity.START
-                        setTextIsSelectable(true)
+                    )
+                } else {
+                    displayedTransactions.forEachIndexed {
+                            index,
+                            transaction ->
+
+                        addView(
+                            smallStatus(
+                                formatTransactionHistory(
+                                    listOf(transaction),
+                                    limit = 1,
+                                    showFullTxid = true
+                                )
+                            ).apply {
+                                gravity = Gravity.START
+                                isClickable = true
+                                isFocusable = true
+
+                                setPadding(
+                                    dp(12),
+                                    dp(12),
+                                    dp(12),
+                                    dp(12)
+                                )
+
+                                background =
+                                    roundedDrawable(
+                                        surfaceColorAlt,
+                                        14
+                                    )
+
+                                setOnClickListener {
+                                    showTransactionDetail(
+                                        transaction
+                                    )
+                                }
+                            }
+                        )
+
+                        if (
+                            index <
+                            displayedTransactions.lastIndex
+                        ) {
+                            addView(space(10))
+                        }
                     }
-                )
+                }
 
                 if (
                     filteredTransactions.size >
@@ -1537,12 +2000,54 @@ class WalletActivity : FragmentActivity() {
         val addressIndex = currentReceiveAddressIndex()
         val address = deriveAddress(words, addressIndex)
 
+        val cachedUtxos =
+            loadCachedWalletUtxos()
+
+        latestChainHeight =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+                .getInt(
+                    PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                    0
+                )
+                .coerceAtLeast(0)
+
+        val cachedTransactions =
+            loadCachedWalletTransactions()
+
+        latestSpendableUtxos = cachedUtxos
+        latestWalletTransactions = cachedTransactions
+
+        val cachedBalance =
+            cachedUtxos.sumOf { it.value }
+
+        val cachedBalanceText =
+            String.format(
+                "%.8f VTX",
+                cachedBalance.toDouble() /
+                    100_000_000.0
+            )
+
         val content = baseLayout()
-        val balanceView = headlineValue("0.00000000 VTX")
+        val balanceView = headlineValue(cachedBalanceText)
         walletBalanceView = balanceView
-        val compactFilterStatus = smallStatus("Compact filters: checking peers...")
-        val scanStatus = smallStatus("Wallet scan: not started")
-        val historyView = smallStatus("No confirmed transactions yet")
+        val compactFilterStatus =
+            smallStatus("Compact filters: checking peers...")
+        val scanStatus =
+            smallStatus(
+                if (hasCachedWalletState()) {
+                    "Wallet ready — background synchronization active"
+                } else {
+                    "Wallet scan: not started"
+                }
+            )
+        val historyView =
+            smallStatus(
+                formatTransactionHistory(
+                    cachedTransactions,
+                    limit = 3,
+                    showFullTxid = false
+                )
+            )
 
         blockchainScanStatus = scanStatus
         walletHistoryView = historyView
@@ -1725,18 +2230,22 @@ class WalletActivity : FragmentActivity() {
         refreshHandler.removeCallbacks(refreshRunnable)
         refreshHandler.postDelayed(refreshRunnable, 60_000L)
 
-        automaticScanStarted = true
+        if (!automaticScanStarted) {
+            automaticScanStarted = true
 
-        window.decorView.postDelayed({
-            if (
-                !isFinishing &&
-                !isDestroyed &&
-                mainWalletVisible &&
-                !blockchainScanRunning
-            ) {
-                startHeaderSyncAndScan()
+            if (!hasCachedWalletState()) {
+                window.decorView.postDelayed({
+                    if (
+                        !isFinishing &&
+                        !isDestroyed &&
+                        mainWalletVisible &&
+                        !blockchainScanRunning
+                    ) {
+                        startHeaderSyncAndScan()
+                    }
+                }, 500L)
             }
-        }, 500L)
+        }
 
 
         Thread {
@@ -1764,6 +2273,152 @@ class WalletActivity : FragmentActivity() {
                         }
             }
         }.start()
+    }
+
+    private fun showAddressLabelManager() {
+        mainWalletVisible = false
+
+        val words = try {
+            loadMnemonic()
+                .trim()
+                .split(Regex("\\s+"))
+        } catch (error: Exception) {
+            showFatalError(
+                "Unable to load wallet: " +
+                    (error.message ?: error.javaClass.simpleName)
+            )
+            return
+        }
+
+        val highestIndex = currentReceiveAddressIndex()
+
+        val content = baseLayout()
+        content.addView(space(10))
+        content.addView(centeredLogo(72))
+        content.addView(space(14))
+        content.addView(title("Address Labels"))
+        content.addView(
+            subtitle(
+                "Name your receive addresses for easier identification"
+            )
+        )
+        content.addView(space(20))
+
+        for (index in 0..highestIndex) {
+            val address = deriveAddress(words, index)
+            val label = addressLabel(index)
+
+            content.addView(
+                card {
+                    addView(
+                        sectionTitle(
+                            if (label.isBlank()) {
+                                "Address ${index + 1}"
+                            } else {
+                                label
+                            }
+                        )
+                    )
+
+                    addView(space(8))
+
+                    addView(
+                        smallStatus(
+                            "Address ${index + 1}"
+                        )
+                    )
+
+                    addView(space(8))
+
+                    addView(
+                        infoBox(
+                            address,
+                            14f,
+                            Gravity.CENTER
+                        ).apply {
+                            isClickable = true
+                            isFocusable = true
+
+                            setOnClickListener {
+                                val clipboard =
+                                    getSystemService(
+                                        Context.CLIPBOARD_SERVICE
+                                    ) as ClipboardManager
+
+                                clipboard.setPrimaryClip(
+                                    ClipData.newPlainText(
+                                        "Vexta address",
+                                        address
+                                    )
+                                )
+
+                                Toast.makeText(
+                                    this@WalletActivity,
+                                    "Address copied",
+                                    Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    )
+
+                    addView(space(10))
+
+                    addView(
+                        secondaryButton(
+                            if (label.isBlank()) {
+                                "Add label"
+                            } else {
+                                "Edit label"
+                            }
+                        ) {
+                            val input =
+                                EditText(this@WalletActivity).apply {
+                                    hint =
+                                        "e.g. Mining, Pool payout, Personal"
+                                    setText(label)
+                                    setSelection(text.length)
+                                }
+
+                            AlertDialog.Builder(
+                                this@WalletActivity
+                            )
+                                .setTitle(
+                                    "Address ${index + 1} label"
+                                )
+                                .setView(input)
+                                .setNegativeButton(
+                                    "Cancel",
+                                    null
+                                )
+                                .setNeutralButton(
+                                    "Remove"
+                                ) { _, _ ->
+                                    setAddressLabel(index, "")
+                                    showAddressLabelManager()
+                                }
+                                .setPositiveButton(
+                                    "Save"
+                                ) { _, _ ->
+                                    setAddressLabel(
+                                        index,
+                                        input.text.toString()
+                                    )
+                                    showAddressLabelManager()
+                                }
+                                .show()
+                        }
+                    )
+                }
+            )
+
+            content.addView(space(14))
+        }
+
+        setContentView(
+            scroll(content) {
+                showReceive()
+            }
+        )
     }
 
     private fun showReceive() {
@@ -1806,6 +2461,18 @@ class WalletActivity : FragmentActivity() {
                         "Receive address ${addressIndex + 1}"
                     )
                 )
+
+                val currentLabel = addressLabel(addressIndex)
+
+                if (currentLabel.isNotBlank()) {
+                    addView(space(8))
+                    addView(
+                        smallStatus(
+                            "Label: $currentLabel"
+                        )
+                    )
+                }
+
                 addView(space(14))
 
                 addView(
@@ -1870,6 +2537,36 @@ class WalletActivity : FragmentActivity() {
                         "Tap the address to copy it"
                     )
                 )
+                addView(space(12))
+                addView(
+                    secondaryButton("Edit address label") {
+                        val input =
+                            EditText(this@WalletActivity).apply {
+                                hint = "e.g. Mining, Pool payout, Personal"
+                                setText(addressLabel(addressIndex))
+                                setSelection(text.length)
+                            }
+
+                        AlertDialog.Builder(this@WalletActivity)
+                            .setTitle(
+                                "Address ${addressIndex + 1} label"
+                            )
+                            .setView(input)
+                            .setNegativeButton("Cancel", null)
+                            .setNeutralButton("Remove") { _, _ ->
+                                setAddressLabel(addressIndex, "")
+                                showReceive()
+                            }
+                            .setPositiveButton("Save") { _, _ ->
+                                setAddressLabel(
+                                    addressIndex,
+                                    input.text.toString()
+                                )
+                                showReceive()
+                            }
+                            .show()
+                    }
+                )
             }
         )
 
@@ -1879,6 +2576,12 @@ class WalletActivity : FragmentActivity() {
             card {
                 addView(sectionTitle("Address management"))
                 addView(space(12))
+                addView(
+                    secondaryButton("Manage address labels") {
+                        showAddressLabelManager()
+                    }
+                )
+                addView(space(10))
                 addView(
                     secondaryButton("Generate new address") {
                         AlertDialog.Builder(
@@ -1957,6 +2660,519 @@ class WalletActivity : FragmentActivity() {
         return false
     }
 
+    private fun saveOutgoingTransactionRecord(
+        record: OutgoingTransactionRecord
+    ) {
+        val preferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        val existing =
+            preferences.getStringSet(
+                PREF_OUTGOING_TRANSACTIONS,
+                emptySet()
+            )?.toMutableSet() ?: mutableSetOf()
+
+        existing.removeAll {
+            it.substringBefore("|") == record.txid
+        }
+
+        existing.add(
+            listOf(
+                record.txid,
+                record.amountSatoshis.toString(),
+                record.feeSatoshis.toString(),
+                record.recipientAddress,
+                record.sentTime.toString()
+            ).joinToString("|")
+        )
+
+        preferences.edit()
+            .putStringSet(
+                PREF_OUTGOING_TRANSACTIONS,
+                existing
+            )
+            .apply()
+    }
+
+    private fun loadOutgoingTransactionRecords(
+        preferences: android.content.SharedPreferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+    ): List<OutgoingTransactionRecord> {
+        val values =
+            preferences.getStringSet(
+                PREF_OUTGOING_TRANSACTIONS,
+                emptySet()
+            ) ?: emptySet()
+
+        return values.mapNotNull { value ->
+            try {
+                val parts = value.split("|")
+
+                if (parts.size != 5) {
+                    return@mapNotNull null
+                }
+
+                OutgoingTransactionRecord(
+                    txid = parts[0],
+                    amountSatoshis = parts[1].toLong(),
+                    feeSatoshis = parts[2].toLong(),
+                    recipientAddress = parts[3],
+                    sentTime = parts[4].toLong()
+                )
+            } catch (_: Exception) {
+                null
+            }
+        }
+    }
+
+    private fun loadContacts(): List<WalletContact> {
+        val preferences =
+            getSharedPreferences(
+                CONTACT_PREFS,
+                MODE_PRIVATE
+            )
+
+        val json =
+            preferences.getString(
+                PREF_CONTACTS_JSON,
+                "[]"
+            ) ?: "[]"
+
+        return try {
+            val array = org.json.JSONArray(json)
+
+            buildList {
+                for (index in 0 until array.length()) {
+                    val item =
+                        array.optJSONObject(index)
+                            ?: continue
+
+                    val id =
+                        item.optString("id").trim()
+
+                    val name =
+                        item.optString("name").trim()
+
+                    val address =
+                        item.optString("address").trim()
+
+                    if (
+                        id.isNotBlank() &&
+                        name.isNotBlank() &&
+                        address.isNotBlank()
+                    ) {
+                        add(
+                            WalletContact(
+                                id = id,
+                                name = name,
+                                address = address
+                            )
+                        )
+                    }
+                }
+            }.sortedBy {
+                it.name.lowercase(
+                    java.util.Locale.getDefault()
+                )
+            }
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
+    private fun saveContacts(
+        contacts: List<WalletContact>
+    ) {
+        val array = org.json.JSONArray()
+
+        contacts.forEach { contact ->
+            array.put(
+                org.json.JSONObject().apply {
+                    put("id", contact.id)
+                    put("name", contact.name)
+                    put("address", contact.address)
+                }
+            )
+        }
+
+        getSharedPreferences(
+            CONTACT_PREFS,
+            MODE_PRIVATE
+        )
+            .edit()
+            .putString(
+                PREF_CONTACTS_JSON,
+                array.toString()
+            )
+            .apply()
+    }
+
+    private fun showContactEditor(
+        recipientInput: EditText,
+        existing: WalletContact? = null
+    ) {
+        val content =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(
+                    dp(20),
+                    dp(8),
+                    dp(20),
+                    dp(4)
+                )
+            }
+
+        val nameInput =
+            inputField(
+                hint = "Contact name",
+                singleLine = true
+            ).apply {
+                setText(existing?.name ?: "")
+            }
+
+        val addressInput =
+            inputField(
+                hint = "Vexta address",
+                singleLine = false
+            ).apply {
+                setText(existing?.address ?: "")
+            }
+
+        content.addView(nameInput)
+        content.addView(space(12))
+        content.addView(addressInput)
+
+        val dialog =
+            AlertDialog.Builder(this)
+                .setTitle(
+                    if (existing == null) {
+                        "Add contact"
+                    } else {
+                        "Edit contact"
+                    }
+                )
+                .setView(content)
+                .setNegativeButton("Cancel", null)
+                .setPositiveButton("Save", null)
+                .create()
+
+        dialog.setOnShowListener {
+            dialog.getButton(
+                AlertDialog.BUTTON_POSITIVE
+            ).setOnClickListener {
+                val name =
+                    nameInput.text
+                        .toString()
+                        .trim()
+
+                val address =
+                    addressInput.text
+                        .toString()
+                        .trim()
+
+                if (name.isBlank()) {
+                    Toast.makeText(
+                        this,
+                        "Enter a contact name",
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                    return@setOnClickListener
+                }
+
+                if (address.isBlank()) {
+                    Toast.makeText(
+                        this,
+                        "Enter a Vexta address",
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                    return@setOnClickListener
+                }
+
+                if (
+                    !address.startsWith("vtx1") &&
+                    !address.startsWith("V")
+                ) {
+                    Toast.makeText(
+                        this,
+                        "Enter a valid Vexta address",
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                    return@setOnClickListener
+                }
+
+                val contacts =
+                    loadContacts().toMutableList()
+
+                val duplicate =
+                    contacts.any { contact ->
+                        contact.id != existing?.id &&
+                            contact.address.equals(
+                                address,
+                                ignoreCase = true
+                            )
+                    }
+
+                if (duplicate) {
+                    Toast.makeText(
+                        this,
+                        "This address is already in Contacts",
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                    return@setOnClickListener
+                }
+
+                val savedContact =
+                    WalletContact(
+                        id =
+                            existing?.id
+                                ?: java.util.UUID
+                                    .randomUUID()
+                                    .toString(),
+                        name = name,
+                        address = address
+                    )
+
+                if (existing == null) {
+                    contacts.add(savedContact)
+                } else {
+                    val index =
+                        contacts.indexOfFirst {
+                            it.id == existing.id
+                        }
+
+                    if (index >= 0) {
+                        contacts[index] =
+                            savedContact
+                    } else {
+                        contacts.add(
+                            savedContact
+                        )
+                    }
+                }
+
+                saveContacts(contacts)
+
+                Toast.makeText(
+                    this,
+                    if (existing == null) {
+                        "Contact added"
+                    } else {
+                        "Contact updated"
+                    },
+                    Toast.LENGTH_SHORT
+                ).show()
+
+                dialog.dismiss()
+
+                showContactsDialog(
+                    recipientInput
+                )
+            }
+        }
+
+        dialog.show()
+    }
+
+    private fun deleteContact(
+        recipientInput: EditText,
+        contact: WalletContact
+    ) {
+        AlertDialog.Builder(this)
+            .setTitle("Delete contact")
+            .setMessage(
+                "Delete ${contact.name} from Contacts?"
+            )
+            .setNegativeButton("Cancel", null)
+            .setPositiveButton("Delete") { _, _ ->
+                val contacts =
+                    loadContacts()
+                        .filterNot {
+                            it.id == contact.id
+                        }
+
+                saveContacts(contacts)
+
+                Toast.makeText(
+                    this,
+                    "Contact deleted",
+                    Toast.LENGTH_SHORT
+                ).show()
+
+                showContactsDialog(
+                    recipientInput
+                )
+            }
+            .show()
+    }
+
+    private fun showContactActions(
+        recipientInput: EditText,
+        contact: WalletContact
+    ) {
+        val content =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(
+                    dp(20),
+                    dp(10),
+                    dp(20),
+                    dp(6)
+                )
+            }
+
+        content.addView(
+            TextView(this).apply {
+                text = contact.address
+                gravity = Gravity.CENTER
+                setTextColor(accentColor)
+
+                maxLines = 1
+                isSingleLine = true
+
+                setAutoSizeTextTypeUniformWithConfiguration(
+                    8,
+                    15,
+                    1,
+                    android.util.TypedValue.COMPLEX_UNIT_SP
+                )
+
+                paintFlags =
+                    paintFlags or
+                        android.graphics.Paint.UNDERLINE_TEXT_FLAG
+
+                isClickable = true
+                isFocusable = true
+
+                setPadding(
+                    dp(4),
+                    dp(14),
+                    dp(4),
+                    dp(14)
+                )
+
+                setOnClickListener {
+                    recipientInput.setText(
+                        contact.address
+                    )
+
+                    Toast.makeText(
+                        this@WalletActivity,
+                        "${contact.name} selected",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+        )
+
+        content.addView(space(22))
+
+        content.addView(
+            primaryButton("Edit contact") {
+                showContactEditor(
+                    recipientInput,
+                    contact
+                )
+            }
+        )
+
+        content.addView(space(12))
+
+        content.addView(
+            primaryButton("Delete contact") {
+                deleteContact(
+                    recipientInput,
+                    contact
+                )
+            }
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle(contact.name)
+            .setView(content)
+            .setNegativeButton("Close", null)
+            .show()
+    }
+
+    private fun showContactsDialog(
+        recipientInput: EditText
+    ) {
+        val contacts = loadContacts()
+
+        val content =
+            LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(
+                    dp(20),
+                    dp(8),
+                    dp(20),
+                    dp(4)
+                )
+            }
+
+        lateinit var contactsDialog: AlertDialog
+
+        if (contacts.isEmpty()) {
+            content.addView(
+                smallStatus(
+                    "No contacts saved yet."
+                )
+            )
+        } else {
+            contacts.forEachIndexed {
+                    index,
+                    contact ->
+
+                content.addView(
+                    secondaryButton(
+                        contact.name + "\n" +
+                            contact.address
+                    ) {
+                        contactsDialog.dismiss()
+
+                        showContactActions(
+                            recipientInput,
+                            contact
+                        )
+                    }
+                )
+
+                if (index < contacts.lastIndex) {
+                    content.addView(space(10))
+                }
+            }
+        }
+
+        content.addView(space(16))
+
+        content.addView(
+            primaryButton("Add contact") {
+                contactsDialog.dismiss()
+
+                showContactEditor(
+                    recipientInput
+                )
+            }
+        )
+
+        val scroll =
+            ScrollView(this).apply {
+                addView(content)
+            }
+
+        contactsDialog =
+            AlertDialog.Builder(this)
+                .setTitle("Contacts")
+                .setView(scroll)
+                .setNegativeButton("Close", null)
+                .create()
+
+        contactsDialog.show()
+    }
+
     private fun showSend(fromAddress: String) {
         mainWalletVisible = false
         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
@@ -2032,6 +3248,16 @@ class WalletActivity : FragmentActivity() {
                             ).show()
                         }
                 })
+
+                addView(space(10))
+
+                addView(
+                    secondaryButton("Contacts") {
+                        showContactsDialog(
+                            recipientInput
+                        )
+                    }
+                )
 
                 addView(space(12))
                 addView(amountInput)
@@ -2269,6 +3495,21 @@ class WalletActivity : FragmentActivity() {
                                                     "74.208.53.160"
                                                 )
                                             )
+
+                                        saveOutgoingTransactionRecord(
+                                            OutgoingTransactionRecord(
+                                                txid = transaction.txid,
+                                                amountSatoshis =
+                                                    transaction.amount,
+                                                feeSatoshis =
+                                                    transaction.fee,
+                                                recipientAddress =
+                                                    recipient,
+                                                sentTime =
+                                                    System.currentTimeMillis() /
+                                                        1000L
+                                            )
+                                        )
 
                                         val accepted =
                                             waitForTransactionAcceptance(
