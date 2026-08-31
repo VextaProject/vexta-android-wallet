@@ -74,6 +74,8 @@ import javax.crypto.spec.GCMParameterSpec
 class WalletActivity : FragmentActivity() {
 
     companion object {
+        const val COINBASE_MATURITY = 100
+
         private const val PREFS = "vexta_wallet"
         private const val KEY_ALIAS = "vexta_wallet_seed_key"
         private const val PREF_CIPHERTEXT = "seed_ciphertext"
@@ -108,6 +110,8 @@ class WalletActivity : FragmentActivity() {
             "background_transaction_history"
         private const val PREF_LAST_BACKGROUND_SCAN_HEIGHT =
             "last_background_scan_height"
+        private const val PREF_FIAT_CURRENCY =
+            "preferred_fiat_currency"
 
         private const val CONTACT_PREFS =
             "vexta_wallet_contacts"
@@ -144,6 +148,18 @@ class WalletActivity : FragmentActivity() {
         emptyList<BlockScanner.SpendableUtxo>()
     private var latestChainHeight = 0
 
+    private fun spendableUtxos(
+        utxos: List<BlockScanner.SpendableUtxo>,
+        chainHeight: Int
+    ): List<BlockScanner.SpendableUtxo> =
+        utxos.filter { utxo ->
+            !utxo.isCoinbase ||
+                (
+                    chainHeight >= utxo.height &&
+                        chainHeight - utxo.height + 1 >= COINBASE_MATURITY
+                )
+        }
+
     private data class OutgoingTransactionRecord(
         val txid: String,
         val amountSatoshis: Long,
@@ -174,7 +190,20 @@ class WalletActivity : FragmentActivity() {
                 val cachedTransactions =
                     loadCachedWalletTransactions()
 
-                latestSpendableUtxos = cachedUtxos
+                latestChainHeight =
+                    getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .getInt(
+                            PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                            0
+                        )
+                        .coerceAtLeast(0)
+
+                latestSpendableUtxos =
+                    spendableUtxos(
+                        cachedUtxos,
+                        latestChainHeight
+                    )
+
                 latestWalletTransactions =
                     cachedTransactions
 
@@ -1001,7 +1030,7 @@ class WalletActivity : FragmentActivity() {
                     try {
                         val parts = value.split("|")
 
-                        if (parts.size != 5) {
+                        if (parts.size != 6) {
                             return@mapNotNull null
                         }
 
@@ -1010,7 +1039,8 @@ class WalletActivity : FragmentActivity() {
                             outputIndex = parts[1].toLong(),
                             value = parts[2].toLong(),
                             height = parts[3].toInt(),
-                            addressIndex = parts[4].toInt()
+                            addressIndex = parts[4].toInt(),
+                            isCoinbase = parts[5].toBooleanStrict()
                         )
                     } catch (_: Exception) {
                         null
@@ -1110,6 +1140,109 @@ class WalletActivity : FragmentActivity() {
                 PREF_LAST_BACKGROUND_SCAN_HEIGHT,
                 0
             ) > 0
+    }
+
+    private fun preferredFiatCurrency(): String {
+        return getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(
+                PREF_FIAT_CURRENCY,
+                "GBP"
+            )
+            ?.takeIf {
+                it in setOf("GBP", "EUR", "USD")
+            }
+            ?: "GBP"
+    }
+
+    private fun setPreferredFiatCurrency(
+        currency: String
+    ) {
+        if (currency !in setOf("GBP", "EUR", "USD")) {
+            return
+        }
+
+        getSharedPreferences(PREFS, MODE_PRIVATE)
+            .edit()
+            .putString(
+                PREF_FIAT_CURRENCY,
+                currency
+            )
+            .apply()
+    }
+
+    private fun fiatSymbol(currency: String): String =
+        when (currency) {
+            "GBP" -> "£"
+            "EUR" -> "€"
+            "USD" -> "$"
+            else -> ""
+        }
+
+    private fun loadFiatValues(
+        balanceSatoshis: Long,
+        onLoaded: (Map<String, Double>) -> Unit
+    ) {
+        Thread {
+            try {
+                val nestExJson =
+                    org.json.JSONObject(
+                        java.net.URL(
+                            "https://trade.nestex.one/api/cg/tickers/VTX_USDT"
+                        ).readText()
+                    )
+
+                val vtxUsdt =
+                    nestExJson.getString("last_price")
+                        .toDouble()
+
+                val fxJson =
+                    org.json.JSONObject(
+                        java.net.URL(
+                            "https://api.frankfurter.app/latest?from=USD&to=GBP,EUR"
+                        ).readText()
+                    )
+
+                val rates =
+                    fxJson.getJSONObject("rates")
+
+                val gbpRate =
+                    rates.getDouble("GBP")
+
+                val eurRate =
+                    rates.getDouble("EUR")
+
+                val vtxBalance =
+                    balanceSatoshis.toDouble() /
+                        100_000_000.0
+
+                val usdValue =
+                    vtxBalance * vtxUsdt
+
+                val values =
+                    mapOf(
+                        "USD" to usdValue,
+                        "GBP" to usdValue * gbpRate,
+                        "EUR" to usdValue * eurRate
+                    )
+
+                runOnUiThread {
+                    onLoaded(values)
+                }
+            } catch (_: Exception) {
+            }
+        }.start()
+    }
+
+    private fun formatFiatValue(
+        currency: String,
+        value: Double
+    ): String {
+        return String.format(
+            java.util.Locale.getDefault(),
+            "%s%,.2f",
+            fiatSymbol(currency),
+            value
+        )
     }
 
     private fun currentReceiveAddressIndex(): Int {
@@ -1349,7 +1482,12 @@ class WalletActivity : FragmentActivity() {
                 }
 
                 runOnUiThread {
-                    latestSpendableUtxos = mergedUtxos
+                    latestSpendableUtxos =
+                        spendableUtxos(
+                            mergedUtxos,
+                            latestChainHeight
+                        )
+
                     latestWalletTransactions =
                         mergedTransactions
 
@@ -2014,7 +2152,12 @@ class WalletActivity : FragmentActivity() {
         val cachedTransactions =
             loadCachedWalletTransactions()
 
-        latestSpendableUtxos = cachedUtxos
+        latestSpendableUtxos =
+            spendableUtxos(
+                cachedUtxos,
+                latestChainHeight
+            )
+
         latestWalletTransactions = cachedTransactions
 
         val cachedBalance =
@@ -2075,6 +2218,149 @@ class WalletActivity : FragmentActivity() {
                 )
                 addView(space(12))
                 addView(balanceView)
+
+                addView(space(10))
+
+                val preferredCurrency =
+                    preferredFiatCurrency()
+
+                val alternativeCurrencies =
+                    listOf("GBP", "EUR", "USD")
+                        .filter {
+                            it != preferredCurrency
+                        }
+
+                var fiatValues =
+                    emptyMap<String, Double>()
+
+                val alternativesContainer =
+                    LinearLayout(
+                        this@WalletActivity
+                    ).apply {
+                        orientation =
+                            LinearLayout.VERTICAL
+                        gravity = Gravity.CENTER
+                        visibility = View.GONE
+                    }
+
+                val alternativeViews =
+                    mutableMapOf<String, TextView>()
+
+                fun preferredFiatText(
+                    expanded: Boolean
+                ): String {
+                    val value =
+                        fiatValues[preferredCurrency]
+
+                    val formatted =
+                        if (value != null) {
+                            formatFiatValue(
+                                preferredCurrency,
+                                value
+                            )
+                        } else {
+                            "${fiatSymbol(preferredCurrency)}—"
+                        }
+
+                    return "≈ $formatted  " +
+                        if (expanded) "▴" else "▾"
+                }
+
+                val preferredFiatView =
+                    TextView(
+                        this@WalletActivity
+                    ).apply {
+                        text = preferredFiatText(false)
+                        textSize = 16f
+                        setTextColor(textPrimary)
+                        gravity = Gravity.CENTER
+                        typeface =
+                            Typeface.DEFAULT_BOLD
+                        isClickable = true
+                        isFocusable = true
+
+                        setOnClickListener {
+                            val expanding =
+                                alternativesContainer.visibility !=
+                                    View.VISIBLE
+
+                            alternativesContainer.visibility =
+                                if (expanding) {
+                                    View.VISIBLE
+                                } else {
+                                    View.GONE
+                                }
+
+                            text =
+                                preferredFiatText(expanding)
+                        }
+                    }
+
+                addView(preferredFiatView)
+
+                alternativeCurrencies.forEach {
+                        currency ->
+
+                    val fiatView =
+                        TextView(
+                            this@WalletActivity
+                        ).apply {
+                            text =
+                                "${fiatSymbol(currency)}—"
+                            textSize = 15f
+                            setTextColor(textSecondary)
+                            gravity = Gravity.CENTER
+                            setPadding(
+                                0,
+                                dp(8),
+                                0,
+                                dp(8)
+                            )
+                            isClickable = true
+                            isFocusable = true
+
+                            setOnClickListener {
+                                setPreferredFiatCurrency(
+                                    currency
+                                )
+                                showMainWallet()
+                            }
+                        }
+
+                    alternativeViews[currency] =
+                        fiatView
+
+                    alternativesContainer.addView(
+                        fiatView
+                    )
+                }
+
+                addView(alternativesContainer)
+
+                loadFiatValues(
+                    cachedBalance
+                ) { values ->
+                    fiatValues = values
+
+                    preferredFiatView.text =
+                        preferredFiatText(
+                            alternativesContainer.visibility ==
+                                View.VISIBLE
+                        )
+
+                    alternativeViews.forEach {
+                            (currency, view) ->
+                        values[currency]?.let {
+                                value ->
+                            view.text =
+                                formatFiatValue(
+                                    currency,
+                                    value
+                                )
+                        }
+                    }
+                }
+
                 addView(space(8))
                 addView(
                     TextView(this@WalletActivity).apply {
@@ -2824,7 +3110,7 @@ class WalletActivity : FragmentActivity() {
 
         val nameInput =
             inputField(
-                hint = "Contact name",
+                hint = "Saved address name",
                 singleLine = true
             ).apply {
                 setText(existing?.name ?: "")
@@ -2846,9 +3132,9 @@ class WalletActivity : FragmentActivity() {
             AlertDialog.Builder(this)
                 .setTitle(
                     if (existing == null) {
-                        "Add contact"
+                        "Add saved address"
                     } else {
-                        "Edit contact"
+                        "Edit saved address"
                     }
                 )
                 .setView(content)
@@ -2873,7 +3159,7 @@ class WalletActivity : FragmentActivity() {
                 if (name.isBlank()) {
                     Toast.makeText(
                         this,
-                        "Enter a contact name",
+                        "Enter a name for this saved address",
                         Toast.LENGTH_LONG
                     ).show()
 
@@ -2918,7 +3204,7 @@ class WalletActivity : FragmentActivity() {
                 if (duplicate) {
                     Toast.makeText(
                         this,
-                        "This address is already in Contacts",
+                        "This address is already saved",
                         Toast.LENGTH_LONG
                     ).show()
 
@@ -2959,9 +3245,9 @@ class WalletActivity : FragmentActivity() {
                 Toast.makeText(
                     this,
                     if (existing == null) {
-                        "Contact added"
+                        "Saved address added"
                     } else {
-                        "Contact updated"
+                        "Saved address updated"
                     },
                     Toast.LENGTH_SHORT
                 ).show()
@@ -2982,9 +3268,9 @@ class WalletActivity : FragmentActivity() {
         contact: WalletContact
     ) {
         AlertDialog.Builder(this)
-            .setTitle("Delete contact")
+            .setTitle("Delete saved address")
             .setMessage(
-                "Delete ${contact.name} from Contacts?"
+                "Delete ${contact.name} from Saved addresses?"
             )
             .setNegativeButton("Cancel", null)
             .setPositiveButton("Delete") { _, _ ->
@@ -2998,7 +3284,7 @@ class WalletActivity : FragmentActivity() {
 
                 Toast.makeText(
                     this,
-                    "Contact deleted",
+                    "Saved address deleted",
                     Toast.LENGTH_SHORT
                 ).show()
 
@@ -3071,7 +3357,7 @@ class WalletActivity : FragmentActivity() {
         content.addView(space(22))
 
         content.addView(
-            primaryButton("Edit contact") {
+            primaryButton("Edit saved address") {
                 showContactEditor(
                     recipientInput,
                     contact
@@ -3082,7 +3368,7 @@ class WalletActivity : FragmentActivity() {
         content.addView(space(12))
 
         content.addView(
-            primaryButton("Delete contact") {
+            primaryButton("Delete saved address") {
                 deleteContact(
                     recipientInput,
                     contact
@@ -3118,7 +3404,7 @@ class WalletActivity : FragmentActivity() {
         if (contacts.isEmpty()) {
             content.addView(
                 smallStatus(
-                    "No contacts saved yet."
+                    "No saved addresses yet."
                 )
             )
         } else {
@@ -3149,7 +3435,7 @@ class WalletActivity : FragmentActivity() {
         content.addView(space(16))
 
         content.addView(
-            primaryButton("Add contact") {
+            primaryButton("Add saved address") {
                 contactsDialog.dismiss()
 
                 showContactEditor(
@@ -3165,7 +3451,7 @@ class WalletActivity : FragmentActivity() {
 
         contactsDialog =
             AlertDialog.Builder(this)
-                .setTitle("Contacts")
+                .setTitle("Saved addresses")
                 .setView(scroll)
                 .setNegativeButton("Close", null)
                 .create()
@@ -3252,7 +3538,7 @@ class WalletActivity : FragmentActivity() {
                 addView(space(10))
 
                 addView(
-                    secondaryButton("Contacts") {
+                    secondaryButton("Saved addresses") {
                         showContactsDialog(
                             recipientInput
                         )
@@ -3286,7 +3572,8 @@ class WalletActivity : FragmentActivity() {
                         try {
                             val maxSpend =
                                 VextaTransactionSender.calculateMaxSpend(
-                                    latestSpendableUtxos
+                                    latestSpendableUtxos,
+                                    latestChainHeight
                                 )
 
                             amountInput.setText(
@@ -3433,7 +3720,9 @@ class WalletActivity : FragmentActivity() {
                                 privateKeysByIndex =
                                     privateKeysByIndex,
                                 changePubKeyHash =
-                                    changePubKeyHash
+                                    changePubKeyHash,
+                                chainHeight =
+                                    latestChainHeight
                             )
 
                         val amountDisplay = String.format(

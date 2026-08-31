@@ -49,7 +49,7 @@ class WalletMonitoringService : Service() {
             "background_transaction_history"
         private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
             "background_transaction_history_version"
-        private const val BACKGROUND_TX_HISTORY_VERSION = 1
+        private const val BACKGROUND_TX_HISTORY_VERSION = 2
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -210,6 +210,9 @@ class WalletMonitoringService : Service() {
 
                 val mergedTransactions =
                     allTransactions
+                        .distinctBy {
+                            "${it.txid}:${it.height}:${it.netSatoshis}:${it.blockTime}"
+                        }
                         .groupBy { it.txid }
                         .map { (_, transactions) ->
                             val newest =
@@ -228,9 +231,15 @@ class WalletMonitoringService : Service() {
                         }
                         .filter { it.netSatoshis != 0L }
 
-                updateIncomingTransactionsAndNotify(
-                    mergedTransactions
-                )
+                if (fullScanRequired) {
+                    synchronizeKnownIncomingTransactions(
+                        mergedTransactions
+                    )
+                } else {
+                    updateIncomingTransactionsAndNotify(
+                        mergedTransactions
+                    )
+                }
 
                 val cachedTransactions =
                     if (fullScanRequired) {
@@ -332,6 +341,36 @@ class WalletMonitoringService : Service() {
         }
     }
 
+    private fun synchronizeKnownIncomingTransactions(
+        transactions: List<BlockScanner.WalletTransaction>
+    ) {
+        val preferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        val knownTxids =
+            preferences.getStringSet(
+                PREF_KNOWN_INCOMING_TXIDS,
+                emptySet()
+            )?.toMutableSet() ?: mutableSetOf()
+
+        knownTxids.addAll(
+            transactions
+                .filter { it.netSatoshis > 0L }
+                .map { it.txid }
+        )
+
+        preferences.edit()
+            .putBoolean(
+                PREF_TX_NOTIFICATIONS_INITIALIZED,
+                true
+            )
+            .putStringSet(
+                PREF_KNOWN_INCOMING_TXIDS,
+                knownTxids
+            )
+            .apply()
+    }
+
     private fun updateIncomingTransactionsAndNotify(
         transactions: List<BlockScanner.WalletTransaction>
     ) {
@@ -371,25 +410,32 @@ class WalletMonitoringService : Service() {
             )?.toMutableSet() ?: mutableSetOf()
 
         incoming
+            .distinctBy { it.txid }
             .filter { it.txid !in knownTxids }
             .sortedBy { it.height }
             .forEach { transaction ->
-                showIncomingPaymentNotification(
-                    transaction.netSatoshis
-                )
                 knownTxids.add(transaction.txid)
-            }
 
-        preferences.edit()
-            .putStringSet(
-                PREF_KNOWN_INCOMING_TXIDS,
-                knownTxids
-            )
-            .apply()
+                val saved =
+                    preferences.edit()
+                        .putStringSet(
+                            PREF_KNOWN_INCOMING_TXIDS,
+                            knownTxids.toSet()
+                        )
+                        .commit()
+
+                if (saved) {
+                    showIncomingPaymentNotification(
+                        transaction.netSatoshis,
+                        transaction.txid
+                    )
+                }
+            }
     }
 
     private fun showIncomingPaymentNotification(
-        receivedSatoshis: Long
+        receivedSatoshis: Long,
+        txid: String
     ) {
         if (
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -446,7 +492,7 @@ class WalletMonitoringService : Service() {
             ) as NotificationManager
 
         manager.notify(
-            (System.currentTimeMillis() and 0x7fffffff).toInt(),
+            txid.hashCode(),
             notification
         )
     }
@@ -460,7 +506,8 @@ class WalletMonitoringService : Service() {
                 utxo.outputIndex.toString(),
                 utxo.value.toString(),
                 utxo.height.toString(),
-                utxo.addressIndex.toString()
+                utxo.addressIndex.toString(),
+                utxo.isCoinbase.toString()
             ).joinToString("|")
         }.toSet()
 
@@ -478,7 +525,7 @@ class WalletMonitoringService : Service() {
             try {
                 val parts = value.split("|")
 
-                if (parts.size != 5) {
+                if (parts.size != 6) {
                     return@mapNotNull null
                 }
 
@@ -487,7 +534,8 @@ class WalletMonitoringService : Service() {
                     outputIndex = parts[1].toLong(),
                     value = parts[2].toLong(),
                     height = parts[3].toInt(),
-                    addressIndex = parts[4].toInt()
+                    addressIndex = parts[4].toInt(),
+                    isCoinbase = parts[5].toBooleanStrict()
                 )
             } catch (_: Exception) {
                 null

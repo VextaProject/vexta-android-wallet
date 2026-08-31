@@ -48,9 +48,40 @@ object VextaTransactionSender {
         val fee: Long
     )
 
+    private const val COINBASE_MATURITY = 100
+
+    private fun validateCoinbaseMaturity(
+        utxos: List<BlockScanner.SpendableUtxo>,
+        chainHeight: Int
+    ) {
+        require(chainHeight >= 0) {
+            "Invalid blockchain height"
+        }
+
+        val immatureCoinbase =
+            utxos.firstOrNull { utxo ->
+                utxo.isCoinbase &&
+                    (
+                        chainHeight < utxo.height ||
+                            chainHeight - utxo.height + 1 <
+                                COINBASE_MATURITY
+                    )
+            }
+
+        require(immatureCoinbase == null) {
+            "Immature mining reward cannot be spent before 100 confirmations"
+        }
+    }
+
     fun calculateMaxSpend(
-        spendableUtxos: List<BlockScanner.SpendableUtxo>
+        spendableUtxos: List<BlockScanner.SpendableUtxo>,
+        chainHeight: Int
     ): MaxSpend {
+        validateCoinbaseMaturity(
+            spendableUtxos,
+            chainHeight
+        )
+
         require(spendableUtxos.isNotEmpty()) {
             "Wallet has no spendable outputs"
         }
@@ -81,8 +112,13 @@ object VextaTransactionSender {
         recipientAddress: String,
         amountSatoshis: Long,
         privateKeysByIndex: Map<Int, ECKey>,
-        changePubKeyHash: ByteArray
+        changePubKeyHash: ByteArray,
+        chainHeight: Int
     ): CreatedTransaction {
+        validateCoinbaseMaturity(
+            spendableUtxos,
+            chainHeight
+        )
         require(amountSatoshis > 0L) {
             "Amount must be greater than zero"
         }
@@ -105,7 +141,11 @@ object VextaTransactionSender {
                 .thenBy { it.outputIndex }
         )
 
-        val maxSpend = calculateMaxSpend(orderedUtxos)
+        val maxSpend =
+            calculateMaxSpend(
+                orderedUtxos,
+                chainHeight
+            )
         val sendingMaximum =
             amountSatoshis == maxSpend.amount
 

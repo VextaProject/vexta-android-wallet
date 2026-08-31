@@ -28,7 +28,8 @@ object BlockScanner {
         val outputIndex: Long,
         val value: Long,
         val height: Int,
-        val addressIndex: Int
+        val addressIndex: Int,
+        val isCoinbase: Boolean
     )
 
     data class WalletTransaction(
@@ -56,13 +57,15 @@ object BlockScanner {
         val outputIndex: Long,
         val value: Long,
         val height: Int,
-        val addressIndex: Int
+        val addressIndex: Int,
+        val isCoinbase: Boolean
     )
 
     private data class ParsedTransaction(
         val txidWire: ByteArray,
         val inputs: List<OutPoint>,
-        val outputs: List<TransactionOutput>
+        val outputs: List<TransactionOutput>,
+        val isCoinbase: Boolean
     )
 
     private data class OutPoint(
@@ -139,7 +142,8 @@ object BlockScanner {
                         outputIndex = existing.outputIndex,
                         value = existing.value,
                         height = existing.height,
-                        addressIndex = existing.addressIndex
+                        addressIndex = existing.addressIndex,
+                        isCoinbase = existing.isCoinbase
                     )
             }
         var receivedTransactions = 0
@@ -235,7 +239,8 @@ object BlockScanner {
                                             transactionOutput.index.toLong(),
                                         value = transactionOutput.value,
                                         height = height,
-                                        addressIndex = addressIndex
+                                        addressIndex = addressIndex,
+                                        isCoinbase = transaction.isCoinbase
                                     )
 
                                     receivedWalletValue +=
@@ -282,7 +287,8 @@ object BlockScanner {
                                         outputIndex = utxo.outputIndex,
                                         value = utxo.value,
                                         height = utxo.height,
-                                        addressIndex = utxo.addressIndex
+                                        addressIndex = utxo.addressIndex,
+                                        isCoinbase = utxo.isCoinbase
                                     )
                                 }
 
@@ -461,10 +467,16 @@ object BlockScanner {
         val lockTime = cursor.readBytes(4)
         stripped.write(lockTime)
 
+        val isCoinbase =
+            inputs.size == 1 &&
+                inputs[0].index == 0xffffffffL &&
+                inputs[0].txidWire.all { it == 0.toByte() }
+
         return ParsedTransaction(
             txidWire = doubleSha256(stripped.toByteArray()),
             inputs = inputs,
-            outputs = outputs
+            outputs = outputs,
+            isCoinbase = isCoinbase
         )
     }
 
