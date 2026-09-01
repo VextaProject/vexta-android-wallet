@@ -37,6 +37,7 @@ object BlockScanner {
         val height: Int,
         val netSatoshis: Long,
         val blockTime: Long,
+        val isCoinbase: Boolean = false,
         val isPending: Boolean = false,
         val feeSatoshis: Long? = null,
         val recipientAddress: String? = null
@@ -263,7 +264,8 @@ object BlockScanner {
                                             .toHex(),
                                         height = height,
                                         netSatoshis = netSatoshis,
-                                        blockTime = blockTime
+                                        blockTime = blockTime,
+                                        isCoinbase = transaction.isCoinbase
                                     )
                                 )
                             }

@@ -136,6 +136,7 @@ object HeaderSync {
             var versionInfo: VersionInfo? = null
             var gotVerack = false
             var requested = false
+            var totalReceived = 0
             val cachedBefore = chain.last().height
 
             repeat(200) {
@@ -153,6 +154,8 @@ object HeaderSync {
 
                     "headers" -> {
                         val received = parseHeaders(message.second, chain)
+                        totalReceived += received
+
                         val remote = versionInfo
                             ?: throw IllegalStateException("missing node version")
 
@@ -162,8 +165,25 @@ object HeaderSync {
                             )
                         }
 
+                        if (chain.last().height < remote.height) {
+                            if (received == 0) {
+                                throw IllegalStateException(
+                                    "peer advertises height ${remote.height} " +
+                                        "but returned no additional headers"
+                                )
+                            }
+
+                            sendMessage(
+                                output,
+                                "getheaders",
+                                createGetHeadersPayload(chain)
+                            )
+
+                            return@repeat
+                        }
+
                         return SyncResult(
-                            received = received,
+                            received = totalReceived,
                             cachedBefore = cachedBefore,
                             chainHeight = chain.last().height,
                             lastHash = chain.last().hashDisplay
@@ -175,7 +195,7 @@ object HeaderSync {
                     sendMessage(
                         output,
                         "getheaders",
-                        createGetHeadersPayload(chain.last().hashWire)
+                        createGetHeadersPayload(chain)
                     )
                     requested = true
                 }
@@ -201,6 +221,8 @@ object HeaderSync {
             )
         }
 
+        val receivedHeaders = mutableListOf<ByteArray>()
+
         repeat(count) {
             if (buffer.remaining() < 81) {
                 throw IllegalStateException("truncated headers message")
@@ -217,7 +239,33 @@ object HeaderSync {
                 )
             }
 
-            appendVerifiedHeader(chain, raw)
+            receivedHeaders.add(raw)
+        }
+
+        if (receivedHeaders.isNotEmpty()) {
+            val firstPreviousHash =
+                receivedHeaders.first().copyOfRange(4, 36)
+
+            if (!firstPreviousHash.contentEquals(chain.last().hashWire)) {
+                val ancestorIndex =
+                    chain.indexOfLast {
+                        it.hashWire.contentEquals(firstPreviousHash)
+                    }
+
+                if (ancestorIndex < 0) {
+                    throw IllegalStateException(
+                        "peer returned headers with no common ancestor"
+                    )
+                }
+
+                while (chain.lastIndex > ancestorIndex) {
+                    chain.removeAt(chain.lastIndex)
+                }
+            }
+
+            receivedHeaders.forEach { raw ->
+                appendVerifiedHeader(chain, raw)
+            }
         }
 
         return count
@@ -375,12 +423,38 @@ object HeaderSync {
         return compact
     }
 
-    fun createGetHeadersPayload(locatorHash: ByteArray): ByteArray {
+    fun createGetHeadersPayload(chain: List<ChainHeader>): ByteArray {
         val out = ByteArrayOutputStream()
+        val locator = mutableListOf<ByteArray>()
+
+        var index = chain.lastIndex
+        var step = 1
+
+        while (index >= 0) {
+            locator.add(chain[index].hashWire)
+
+            if (index == 0) {
+                break
+            }
+
+            index = (index - step).coerceAtLeast(0)
+
+            if (locator.size >= 10) {
+                step *= 2
+            }
+        }
+
+        if (!locator.last().contentEquals(chain.first().hashWire)) {
+            locator.add(chain.first().hashWire)
+        }
 
         writeInt32LE(out, PROTOCOL_VERSION)
-        writeCompactSize(out, 1)
-        out.write(locatorHash)
+        writeCompactSize(out, locator.size)
+
+        locator.forEach { hash ->
+            out.write(hash)
+        }
+
         out.write(ByteArray(32))
 
         return out.toByteArray()

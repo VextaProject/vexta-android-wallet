@@ -110,6 +110,11 @@ class WalletActivity : FragmentActivity() {
             "background_transaction_history"
         private const val PREF_LAST_BACKGROUND_SCAN_HEIGHT =
             "last_background_scan_height"
+        private const val PREF_LAST_HEADER_HEIGHT =
+            "last_header_height"
+        private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
+            "background_transaction_history_version"
+        private const val BACKGROUND_TX_HISTORY_VERSION = 4
         private const val PREF_FIAT_CURRENCY =
             "preferred_fiat_currency"
 
@@ -147,6 +152,7 @@ class WalletActivity : FragmentActivity() {
     private var latestSpendableUtxos =
         emptyList<BlockScanner.SpendableUtxo>()
     private var latestChainHeight = 0
+    private var walletFiatRefresh: ((Long) -> Unit)? = null
 
     private fun spendableUtxos(
         utxos: List<BlockScanner.SpendableUtxo>,
@@ -193,7 +199,7 @@ class WalletActivity : FragmentActivity() {
                 latestChainHeight =
                     getSharedPreferences(PREFS, MODE_PRIVATE)
                         .getInt(
-                            PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                            PREF_LAST_HEADER_HEIGHT,
                             0
                         )
                         .coerceAtLeast(0)
@@ -216,6 +222,10 @@ class WalletActivity : FragmentActivity() {
                         balanceSatoshis.toDouble() /
                             100_000_000.0
                     )
+
+                walletFiatRefresh?.invoke(
+                    balanceSatoshis
+                )
 
                 walletHistoryView?.text =
                     formatTransactionHistory(
@@ -429,7 +439,7 @@ class WalletActivity : FragmentActivity() {
                     mainWalletVisible &&
                     !blockchainScanRunning
                 ) {
-                    startHeaderSyncAndScan()
+                    startBackgroundHeaderSyncAndScan()
                 }
             }, 400L)
         }
@@ -870,12 +880,21 @@ class WalletActivity : FragmentActivity() {
         }
 
         blockchainScanRunning = true
+        blockchainScanStatus?.text =
+            "Synchronizing block headers..."
 
         Thread {
             try {
                 val chain = HeaderSync.loadCachedChain(this)
 
+                runOnUiThread {
+                    blockchainScanStatus?.text =
+                        "Synchronizing block headers...\n" +
+                            "Cached height: ${chain.last().height}"
+                }
+
                 val syncErrors = mutableListOf<String>()
+                var successfulPeerSyncs = 0
 
                 for (peer in listOf("87.106.99.23", "74.208.53.160")) {
                     try {
@@ -884,6 +903,14 @@ class WalletActivity : FragmentActivity() {
                         if (result.received > 0) {
                             HeaderSync.saveChain(this, chain)
                         }
+
+                        successfulPeerSyncs++
+
+                        runOnUiThread {
+                            blockchainScanStatus?.text =
+                                "Header sync OK: ${result.chainHeight}\n" +
+                                    "Peer: $peer"
+                        }
                     } catch (e: Exception) {
                         syncErrors.add(
                             "$peer: ${e.message ?: e.javaClass.simpleName}"
@@ -891,7 +918,10 @@ class WalletActivity : FragmentActivity() {
                     }
                 }
 
-                if (chain.last().height <= 0) {
+                if (
+                    successfulPeerSyncs == 0 ||
+                    chain.last().height <= 0
+                ) {
                     runOnUiThread {
                         blockchainScanRunning = false
                         blockchainScanStatus?.text =
@@ -904,9 +934,12 @@ class WalletActivity : FragmentActivity() {
                 runOnUiThread {
                     runBlockchainScan()
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 runOnUiThread {
                     blockchainScanRunning = false
+                    blockchainScanStatus?.text =
+                        "Background synchronization failed:\n" +
+                            (e.message ?: e.javaClass.simpleName)
                 }
             }
         }.start()
@@ -946,6 +979,14 @@ class WalletActivity : FragmentActivity() {
                     "verified_height",
                     -1
                 ) ?: -1
+
+                if (height >= 0) {
+                    latestChainHeight = height
+                    getSharedPreferences(PREFS, MODE_PRIVATE)
+                        .edit()
+                        .putInt(PREF_LAST_HEADER_HEIGHT, height)
+                        .apply()
+                }
 
                 blockchainScanStatus?.text = if (height >= 0) {
                     "Headers synchronized to block $height.\n" +
@@ -1073,7 +1114,7 @@ class WalletActivity : FragmentActivity() {
                 try {
                     val parts = value.split("|")
 
-                    if (parts.size != 4) {
+                    if (parts.size != 5) {
                         return@mapNotNull null
                     }
 
@@ -1090,6 +1131,7 @@ class WalletActivity : FragmentActivity() {
                                 parts[2].toLong()
                             },
                         blockTime = parts[3].toLong(),
+                        isCoinbase = parts[4].toBooleanStrict(),
                         feeSatoshis = outgoing?.feeSatoshis,
                         recipientAddress =
                             outgoing?.recipientAddress
@@ -1135,11 +1177,23 @@ class WalletActivity : FragmentActivity() {
     }
 
     private fun hasCachedWalletState(): Boolean {
-        return getSharedPreferences(PREFS, MODE_PRIVATE)
-            .getInt(
+        val preferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        val scanHeight =
+            preferences.getInt(
                 PREF_LAST_BACKGROUND_SCAN_HEIGHT,
                 0
-            ) > 0
+            )
+
+        val cacheVersion =
+            preferences.getInt(
+                PREF_BACKGROUND_TX_HISTORY_VERSION,
+                0
+            )
+
+        return scanHeight > 0 &&
+            cacheVersion == BACKGROUND_TX_HISTORY_VERSION
     }
 
     private fun preferredFiatCurrency(): String {
@@ -1395,6 +1449,9 @@ class WalletActivity : FragmentActivity() {
                                         }
                                     },
                                 blockTime = newest.blockTime,
+                                isCoinbase = transactions.any {
+                                    it.isCoinbase
+                                },
                                 feeSatoshis =
                                     outgoing?.feeSatoshis,
                                 recipientAddress =
@@ -1586,8 +1643,22 @@ class WalletActivity : FragmentActivity() {
                                     1
                             ).coerceAtLeast(1)
 
-                        "Block ${transaction.height}\n" +
-                            "Confirmations: $confirmations"
+                        if (transaction.isCoinbase) {
+                            val maturityStatus =
+                                if (confirmations >= COINBASE_MATURITY) {
+                                    "Coinbase reward — Mature"
+                                } else {
+                                    "Coinbase reward — Immature"
+                                }
+
+                            "Block ${transaction.height}\n" +
+                                "$maturityStatus\n" +
+                                "Confirmations: $confirmations / " +
+                                "$COINBASE_MATURITY"
+                        } else {
+                            "Block ${transaction.height}\n" +
+                                "Confirmations: $confirmations"
+                        }
                     }
 
                 "$direction  $sign$amount VTX\n" +
@@ -1637,7 +1708,14 @@ class WalletActivity : FragmentActivity() {
 
         val details = StringBuilder()
 
-        details.append("Type: $direction\n")
+        details.append(
+            "Type: " +
+                if (transaction.isCoinbase) {
+                    "Coinbase reward\n"
+                } else {
+                    "$direction\n"
+                }
+        )
         details.append("Amount: $amount VTX\n")
         details.append("Date & time: $dateTime\n")
 
@@ -1645,9 +1723,30 @@ class WalletActivity : FragmentActivity() {
             details.append("Status: Pending\n")
             details.append("Confirmations: 0\n")
         } else {
-            details.append("Status: Confirmed\n")
-            details.append("Block: ${transaction.height}\n")
-            details.append("Confirmations: $confirmations\n")
+            if (transaction.isCoinbase) {
+                val mature =
+                    confirmations >= COINBASE_MATURITY
+
+                details.append(
+                    "Status: " +
+                        if (mature) {
+                            "Mature\n"
+                        } else {
+                            "Immature\n"
+                        }
+                )
+                details.append("Block: ${transaction.height}\n")
+                details.append(
+                    "Confirmations: $confirmations / " +
+                        "$COINBASE_MATURITY\n"
+                )
+            } else {
+                details.append("Status: Confirmed\n")
+                details.append("Block: ${transaction.height}\n")
+                details.append(
+                    "Confirmations: $confirmations\n"
+                )
+            }
         }
 
         transaction.feeSatoshis?.let { fee ->
@@ -2144,7 +2243,7 @@ class WalletActivity : FragmentActivity() {
         latestChainHeight =
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .getInt(
-                    PREF_LAST_BACKGROUND_SCAN_HEIGHT,
+                    PREF_LAST_HEADER_HEIGHT,
                     0
                 )
                 .coerceAtLeast(0)
@@ -2337,29 +2436,36 @@ class WalletActivity : FragmentActivity() {
 
                 addView(alternativesContainer)
 
-                loadFiatValues(
-                    cachedBalance
-                ) { values ->
-                    fiatValues = values
+                walletFiatRefresh = {
+                        balanceSatoshis ->
+                    loadFiatValues(
+                        balanceSatoshis
+                    ) { values ->
+                        fiatValues = values
 
-                    preferredFiatView.text =
-                        preferredFiatText(
-                            alternativesContainer.visibility ==
-                                View.VISIBLE
-                        )
+                        preferredFiatView.text =
+                            preferredFiatText(
+                                alternativesContainer.visibility ==
+                                    View.VISIBLE
+                            )
 
-                    alternativeViews.forEach {
-                            (currency, view) ->
-                        values[currency]?.let {
-                                value ->
-                            view.text =
-                                formatFiatValue(
-                                    currency,
-                                    value
-                                )
+                        alternativeViews.forEach {
+                                (currency, view) ->
+                            values[currency]?.let {
+                                    value ->
+                                view.text =
+                                    formatFiatValue(
+                                        currency,
+                                        value
+                                    )
+                            }
                         }
                     }
                 }
+
+                walletFiatRefresh?.invoke(
+                    cachedBalance
+                )
 
                 addView(space(8))
                 addView(
@@ -2422,7 +2528,7 @@ class WalletActivity : FragmentActivity() {
                         symbol = "↻",
                         label = "Scan"
                     ) {
-                        startHeaderSyncAndScan()
+                        startBackgroundHeaderSyncAndScan()
                     }
                 )
 
@@ -2527,7 +2633,7 @@ class WalletActivity : FragmentActivity() {
                         mainWalletVisible &&
                         !blockchainScanRunning
                     ) {
-                        startHeaderSyncAndScan()
+                        startBackgroundHeaderSyncAndScan()
                     }
                 }, 500L)
             }

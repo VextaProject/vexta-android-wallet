@@ -43,13 +43,15 @@ class WalletMonitoringService : Service() {
             "tx_notifications_initialized"
         private const val PREF_LAST_BACKGROUND_SCAN_HEIGHT =
             "last_background_scan_height"
+        private const val PREF_LAST_HEADER_HEIGHT =
+            "last_header_height"
         private const val PREF_BACKGROUND_UTXO_PREFIX =
             "background_utxos_"
         private const val PREF_BACKGROUND_TX_HISTORY =
             "background_transaction_history"
         private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
             "background_transaction_history_version"
-        private const val BACKGROUND_TX_HISTORY_VERSION = 2
+        private const val BACKGROUND_TX_HISTORY_VERSION = 4
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -97,9 +99,23 @@ class WalletMonitoringService : Service() {
             try {
                 val chain = HeaderSync.loadCachedChain(this)
 
+                val cachedTipHeightBeforeSync = chain.last().height
+                val cachedTipHashBeforeSync = chain.last().hashDisplay
+                var reorgDetected = false
+
                 for (peer in listOf("87.106.99.23", "74.208.53.160")) {
                     try {
                         val result = HeaderSync.syncFromPeer(peer, chain)
+
+                        if (cachedTipHeightBeforeSync > 0) {
+                            val originalTipStillCanonical =
+                                chain.getOrNull(cachedTipHeightBeforeSync)
+                                    ?.hashDisplay == cachedTipHashBeforeSync
+
+                            if (!originalTipStillCanonical) {
+                                reorgDetected = true
+                            }
+                        }
 
                         if (result.received > 0) {
                             HeaderSync.saveChain(this, chain)
@@ -121,6 +137,13 @@ class WalletMonitoringService : Service() {
                         .coerceAtLeast(0)
 
                 val localHeight = chain.last().height
+
+                preferences.edit()
+                    .putInt(
+                        PREF_LAST_HEADER_HEIGHT,
+                        localHeight
+                    )
+                    .apply()
 
                 val previousHeight =
                     preferences
@@ -145,7 +168,8 @@ class WalletMonitoringService : Service() {
                     ) == BACKGROUND_TX_HISTORY_VERSION
 
                 val fullScanRequired =
-                    previousHeight <= 0 ||
+                    reorgDetected ||
+                        previousHeight <= 0 ||
                         previousHeight > localHeight ||
                         !backgroundCacheAvailable ||
                         !transactionHistoryCurrent
@@ -226,7 +250,10 @@ class WalletMonitoringService : Service() {
                                 netSatoshis = transactions.sumOf {
                                     it.netSatoshis
                                 },
-                                blockTime = newest.blockTime
+                                blockTime = newest.blockTime,
+                                isCoinbase = transactions.any {
+                                    it.isCoinbase
+                                }
                             )
                         }
                         .filter { it.netSatoshis != 0L }
@@ -308,7 +335,8 @@ class WalletMonitoringService : Service() {
                 transaction.txid,
                 transaction.height.toString(),
                 transaction.netSatoshis.toString(),
-                transaction.blockTime.toString()
+                transaction.blockTime.toString(),
+                transaction.isCoinbase.toString()
             ).joinToString("|")
         }.toSet()
 
@@ -325,7 +353,7 @@ class WalletMonitoringService : Service() {
             try {
                 val parts = value.split("|")
 
-                if (parts.size != 4) {
+                if (parts.size != 5) {
                     return@mapNotNull null
                 }
 
@@ -333,7 +361,8 @@ class WalletMonitoringService : Service() {
                     txid = parts[0],
                     height = parts[1].toInt(),
                     netSatoshis = parts[2].toLong(),
-                    blockTime = parts[3].toLong()
+                    blockTime = parts[3].toLong(),
+                    isCoinbase = parts[4].toBooleanStrict()
                 )
             } catch (_: Exception) {
                 null
