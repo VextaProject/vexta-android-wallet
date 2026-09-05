@@ -1480,17 +1480,44 @@ class WalletActivity : FragmentActivity() {
         super.onActivityResult(requestCode, resultCode, data)
     }
 
-    private fun addressLabel(index: Int): String {
+    private fun addressLabelKey(
+        addressType: ReceiveAddressType,
+        index: Int
+    ): String {
+        return when (addressType) {
+            ReceiveAddressType.STANDARD ->
+                PREF_ADDRESS_LABEL_PREFIX + index
+
+            ReceiveAddressType.MLDSA ->
+                PREF_ADDRESS_LABEL_PREFIX + "MLDSA_" + index
+
+            ReceiveAddressType.SLHDSA ->
+                PREF_ADDRESS_LABEL_PREFIX + "SLHDSA_" + index
+        }
+    }
+
+    private fun addressLabel(
+        addressType: ReceiveAddressType,
+        index: Int
+    ): String {
         return getSharedPreferences(PREFS, MODE_PRIVATE)
             .getString(
-                PREF_ADDRESS_LABEL_PREFIX + index,
+                addressLabelKey(addressType, index),
                 ""
             )
             ?.trim()
             .orEmpty()
     }
 
+    private fun addressLabel(index: Int): String {
+        return addressLabel(
+            ReceiveAddressType.STANDARD,
+            index
+        )
+    }
+
     private fun setAddressLabel(
+        addressType: ReceiveAddressType,
         index: Int,
         label: String
     ) {
@@ -1498,20 +1525,35 @@ class WalletActivity : FragmentActivity() {
             getSharedPreferences(PREFS, MODE_PRIVATE)
                 .edit()
 
+        val key =
+            addressLabelKey(
+                addressType,
+                index
+            )
+
         val value = label.trim()
 
         if (value.isBlank()) {
-            editor.remove(
-                PREF_ADDRESS_LABEL_PREFIX + index
-            )
+            editor.remove(key)
         } else {
             editor.putString(
-                PREF_ADDRESS_LABEL_PREFIX + index,
+                key,
                 value
             )
         }
 
         editor.apply()
+    }
+
+    private fun setAddressLabel(
+        index: Int,
+        label: String
+    ) {
+        setAddressLabel(
+            ReceiveAddressType.STANDARD,
+            index,
+            label
+        )
     }
 
     private fun backgroundUtxoKey(
@@ -3757,30 +3799,36 @@ class WalletActivity : FragmentActivity() {
             return
         }
 
-        val highestIndex = currentReceiveAddressIndex()
-
         val content = baseLayout()
         content.addView(space(10))
         content.addView(centeredLogo(72))
         content.addView(space(14))
-        content.addView(title("Address Labels"))
+        content.addView(title("My addresses"))
         content.addView(
             subtitle(
-                "Name your receive addresses for easier identification"
+                "View, label and select your receive addresses"
             )
         )
         content.addView(space(20))
 
-        for (index in 0..highestIndex) {
-            val address = deriveAddress(words, index)
-            val label = addressLabel(index)
+        fun addAddressCard(
+            addressType: ReceiveAddressType,
+            index: Int,
+            address: String,
+            typeLabel: String
+        ) {
+            val label =
+                addressLabel(
+                    addressType,
+                    index
+                )
 
             content.addView(
                 card {
                     addView(
                         sectionTitle(
                             if (label.isBlank()) {
-                                "Address ${index + 1}"
+                                "$typeLabel address ${index + 1}"
                             } else {
                                 label
                             }
@@ -3791,7 +3839,7 @@ class WalletActivity : FragmentActivity() {
 
                     addView(
                         smallStatus(
-                            "Address ${index + 1}"
+                            "$typeLabel • Address ${index + 1}"
                         )
                     )
 
@@ -3839,7 +3887,9 @@ class WalletActivity : FragmentActivity() {
                             }
                         ) {
                             val input =
-                                EditText(this@WalletActivity).apply {
+                                EditText(
+                                    this@WalletActivity
+                                ).apply {
                                     hint =
                                         "e.g. Mining, Pool payout, Personal"
                                     setText(label)
@@ -3850,7 +3900,7 @@ class WalletActivity : FragmentActivity() {
                                 this@WalletActivity
                             )
                                 .setTitle(
-                                    "Address ${index + 1} label"
+                                    "$typeLabel address ${index + 1} label"
                                 )
                                 .setView(input)
                                 .setNegativeButton(
@@ -3860,13 +3910,18 @@ class WalletActivity : FragmentActivity() {
                                 .setNeutralButton(
                                     "Remove"
                                 ) { _, _ ->
-                                    setAddressLabel(index, "")
+                                    setAddressLabel(
+                                        addressType,
+                                        index,
+                                        ""
+                                    )
                                     showAddressLabelManager()
                                 }
                                 .setPositiveButton(
                                     "Save"
                                 ) { _, _ ->
                                     setAddressLabel(
+                                        addressType,
                                         index,
                                         input.text.toString()
                                     )
@@ -3875,10 +3930,133 @@ class WalletActivity : FragmentActivity() {
                                 .show()
                         }
                     )
+
+                    addView(space(10))
+
+                    val isCurrent =
+                        currentReceiveAddressType() == addressType &&
+                            when (addressType) {
+                                ReceiveAddressType.STANDARD ->
+                                    currentReceiveAddressIndex() == index
+
+                                ReceiveAddressType.MLDSA,
+                                ReceiveAddressType.SLHDSA ->
+                                    currentPqAddressIndex(
+                                        addressType
+                                    ) == index
+                            }
+
+                    if (isCurrent) {
+                        addView(
+                            smallStatus(
+                                "Current receive address"
+                            )
+                        )
+                    } else {
+                        addView(
+                            secondaryButton(
+                                "Use this address"
+                            ) {
+                                when (addressType) {
+                                    ReceiveAddressType.STANDARD ->
+                                        setCurrentReceiveAddressIndex(
+                                            index
+                                        )
+
+                                    ReceiveAddressType.MLDSA,
+                                    ReceiveAddressType.SLHDSA ->
+                                        setCurrentPqAddressIndex(
+                                            addressType,
+                                            index
+                                        )
+                                }
+
+                                setCurrentReceiveAddressType(
+                                    addressType
+                                )
+
+                                showReceive()
+                            }
+                        )
+                    }
                 }
             )
 
             content.addView(space(14))
+        }
+
+        for (
+            index in
+            0..currentReceiveAddressIndex()
+        ) {
+            addAddressCard(
+                ReceiveAddressType.STANDARD,
+                index,
+                deriveAddress(words, index),
+                "Standard"
+            )
+        }
+
+        if (
+            pqAddressCreated(
+                ReceiveAddressType.MLDSA
+            )
+        ) {
+            for (
+                index in
+                0..currentPqAddressIndex(
+                    ReceiveAddressType.MLDSA
+                )
+            ) {
+                val key =
+                    derivePqKey(
+                        words,
+                        ReceiveAddressType.MLDSA,
+                        index
+                    )
+
+                try {
+                    addAddressCard(
+                        ReceiveAddressType.MLDSA,
+                        index,
+                        key.address,
+                        "ML-DSA"
+                    )
+                } finally {
+                    key.secretKey.fill(0)
+                }
+            }
+        }
+
+        if (
+            pqAddressCreated(
+                ReceiveAddressType.SLHDSA
+            )
+        ) {
+            for (
+                index in
+                0..currentPqAddressIndex(
+                    ReceiveAddressType.SLHDSA
+                )
+            ) {
+                val key =
+                    derivePqKey(
+                        words,
+                        ReceiveAddressType.SLHDSA,
+                        index
+                    )
+
+                try {
+                    addAddressCard(
+                        ReceiveAddressType.SLHDSA,
+                        index,
+                        key.address,
+                        "SPHINCS+"
+                    )
+                } finally {
+                    key.secretKey.fill(0)
+                }
+            }
         }
 
         setContentView(
@@ -3986,18 +4164,19 @@ class WalletActivity : FragmentActivity() {
                     )
                 )
 
-                if (receiveType == ReceiveAddressType.STANDARD) {
-                    val currentLabel =
-                        addressLabel(addressIndex)
+                val currentLabel =
+                    addressLabel(
+                        receiveType,
+                        addressIndex
+                    )
 
-                    if (currentLabel.isNotBlank()) {
-                        addView(space(8))
-                        addView(
-                            smallStatus(
-                                "Label: $currentLabel"
-                            )
+                if (currentLabel.isNotBlank()) {
+                    addView(space(8))
+                    addView(
+                        smallStatus(
+                            "Label: $currentLabel"
                         )
-                    }
+                    )
                 }
 
                 addView(space(14))
@@ -4066,57 +4245,6 @@ class WalletActivity : FragmentActivity() {
                     )
                 )
 
-                if (receiveType == ReceiveAddressType.STANDARD) {
-                    addView(space(12))
-                    addView(
-                        secondaryButton("Edit address label") {
-                            val input =
-                                EditText(
-                                    this@WalletActivity
-                                ).apply {
-                                    hint =
-                                        "e.g. Mining, Pool payout, Personal"
-                                    setText(
-                                        addressLabel(
-                                            addressIndex
-                                        )
-                                    )
-                                    setSelection(text.length)
-                                }
-
-                            AlertDialog.Builder(
-                                this@WalletActivity
-                            )
-                                .setTitle(
-                                    "Address ${addressIndex + 1} label"
-                                )
-                                .setView(input)
-                                .setNegativeButton(
-                                    "Cancel",
-                                    null
-                                )
-                                .setNeutralButton(
-                                    "Remove"
-                                ) { _, _ ->
-                                    setAddressLabel(
-                                        addressIndex,
-                                        ""
-                                    )
-                                    showReceive()
-                                }
-                                .setPositiveButton(
-                                    "Save"
-                                ) { _, _ ->
-                                    setAddressLabel(
-                                        addressIndex,
-                                        input.text.toString()
-                                    )
-                                    showReceive()
-                                }
-                                .show()
-                        }
-                    )
-                }
             }
         )
 
@@ -4205,6 +4333,16 @@ class WalletActivity : FragmentActivity() {
                                 null
                             )
                             .show()
+                    }
+                )
+
+                addView(space(10))
+
+                addView(
+                    secondaryButton(
+                        "My addresses"
+                    ) {
+                        showAddressLabelManager()
                     }
                 )
 
