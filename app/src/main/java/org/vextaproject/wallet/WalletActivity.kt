@@ -124,7 +124,7 @@ class WalletActivity : FragmentActivity() {
             "last_header_height"
         private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
             "background_transaction_history_version"
-        private const val BACKGROUND_TX_HISTORY_VERSION = 4
+        private const val BACKGROUND_TX_HISTORY_VERSION = 5
         private const val PREF_FIAT_CURRENCY =
             "preferred_fiat_currency"
 

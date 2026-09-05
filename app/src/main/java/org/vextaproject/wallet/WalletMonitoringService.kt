@@ -59,7 +59,7 @@ class WalletMonitoringService : Service() {
             "background_transaction_history"
         private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
             "background_transaction_history_version"
-        private const val BACKGROUND_TX_HISTORY_VERSION = 4
+        private const val BACKGROUND_TX_HISTORY_VERSION = 5
     }
 
     private fun backgroundUtxoKey(
@@ -195,25 +195,39 @@ class WalletMonitoringService : Service() {
                             )
                     }
 
+                val mldsaAddressCreated =
+                    preferences.getBoolean(
+                        PREF_MLDSA_ADDRESS_CREATED,
+                        false
+                    )
+
+                val slhdsaAddressCreated =
+                    preferences.getBoolean(
+                        PREF_SLHDSA_ADDRESS_CREATED,
+                        false
+                    )
+
                 val mldsaCacheAvailable =
-                    (0..highestMldsaAddressIndex).all { addressIndex ->
-                        preferences.contains(
-                            backgroundUtxoKey(
-                                BlockScanner.AddressType.MLDSA,
-                                addressIndex
+                    !mldsaAddressCreated ||
+                        (0..highestMldsaAddressIndex).all { addressIndex ->
+                            preferences.contains(
+                                backgroundUtxoKey(
+                                    BlockScanner.AddressType.MLDSA,
+                                    addressIndex
+                                )
                             )
-                        )
-                    }
+                        }
 
                 val slhdsaCacheAvailable =
-                    (0..highestSlhdsaAddressIndex).all { addressIndex ->
-                        preferences.contains(
-                            backgroundUtxoKey(
-                                BlockScanner.AddressType.SLHDSA,
-                                addressIndex
+                    !slhdsaAddressCreated ||
+                        (0..highestSlhdsaAddressIndex).all { addressIndex ->
+                            preferences.contains(
+                                backgroundUtxoKey(
+                                    BlockScanner.AddressType.SLHDSA,
+                                    addressIndex
+                                )
                             )
-                        )
-                    }
+                        }
 
                 val backgroundCacheAvailable =
                     standardCacheAvailable &&
@@ -271,12 +285,7 @@ class WalletMonitoringService : Service() {
                             )
                         }
 
-                        if (
-                            preferences.getBoolean(
-                                PREF_MLDSA_ADDRESS_CREATED,
-                                false
-                            )
-                        ) {
+                        if (mldsaAddressCreated) {
                             for (
                                 addressIndex in
                                     0..highestMldsaAddressIndex
@@ -295,12 +304,7 @@ class WalletMonitoringService : Service() {
                             }
                         }
 
-                        if (
-                            preferences.getBoolean(
-                                PREF_SLHDSA_ADDRESS_CREATED,
-                                false
-                            )
-                        ) {
+                        if (slhdsaAddressCreated) {
                             for (
                                 addressIndex in
                                     0..highestSlhdsaAddressIndex
