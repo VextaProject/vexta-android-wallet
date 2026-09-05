@@ -37,6 +37,14 @@ class WalletMonitoringService : Service() {
         private const val PREF_IV = "seed_iv"
         private const val PREF_RECEIVE_ADDRESS_INDEX =
             "receive_address_index"
+        private const val PREF_MLDSA_ADDRESS_INDEX =
+            "mldsa_address_index"
+        private const val PREF_SLHDSA_ADDRESS_INDEX =
+            "slhdsa_address_index"
+        private const val PREF_MLDSA_ADDRESS_CREATED =
+            "mldsa_address_created"
+        private const val PREF_SLHDSA_ADDRESS_CREATED =
+            "slhdsa_address_created"
         private const val PREF_KNOWN_INCOMING_TXIDS =
             "known_incoming_txids"
         private const val PREF_TX_NOTIFICATIONS_INITIALIZED =
@@ -52,6 +60,16 @@ class WalletMonitoringService : Service() {
         private const val PREF_BACKGROUND_TX_HISTORY_VERSION =
             "background_transaction_history_version"
         private const val BACKGROUND_TX_HISTORY_VERSION = 4
+    }
+
+    private fun backgroundUtxoKey(
+        addressType: BlockScanner.AddressType,
+        addressIndex: Int
+    ): String {
+        return PREF_BACKGROUND_UTXO_PREFIX +
+            addressType.name +
+            "_" +
+            addressIndex
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -136,6 +154,16 @@ class WalletMonitoringService : Service() {
                         .getInt(PREF_RECEIVE_ADDRESS_INDEX, 0)
                         .coerceAtLeast(0)
 
+                val highestMldsaAddressIndex =
+                    preferences
+                        .getInt(PREF_MLDSA_ADDRESS_INDEX, 0)
+                        .coerceAtLeast(0)
+
+                val highestSlhdsaAddressIndex =
+                    preferences
+                        .getInt(PREF_SLHDSA_ADDRESS_INDEX, 0)
+                        .coerceAtLeast(0)
+
                 val localHeight = chain.last().height
 
                 preferences.edit()
@@ -153,13 +181,44 @@ class WalletMonitoringService : Service() {
                         )
                         .coerceAtLeast(0)
 
-                val backgroundCacheAvailable =
+                val standardCacheAvailable =
                     (0..highestAddressIndex).all { addressIndex ->
                         preferences.contains(
-                            PREF_BACKGROUND_UTXO_PREFIX +
+                            backgroundUtxoKey(
+                                BlockScanner.AddressType.STANDARD,
                                 addressIndex
+                            )
+                        ) ||
+                            preferences.contains(
+                                PREF_BACKGROUND_UTXO_PREFIX +
+                                    addressIndex
+                            )
+                    }
+
+                val mldsaCacheAvailable =
+                    (0..highestMldsaAddressIndex).all { addressIndex ->
+                        preferences.contains(
+                            backgroundUtxoKey(
+                                BlockScanner.AddressType.MLDSA,
+                                addressIndex
+                            )
                         )
                     }
+
+                val slhdsaCacheAvailable =
+                    (0..highestSlhdsaAddressIndex).all { addressIndex ->
+                        preferences.contains(
+                            backgroundUtxoKey(
+                                BlockScanner.AddressType.SLHDSA,
+                                addressIndex
+                            )
+                        )
+                    }
+
+                val backgroundCacheAvailable =
+                    standardCacheAvailable &&
+                        mldsaCacheAvailable &&
+                        slhdsaCacheAvailable
 
                 val transactionHistoryCurrent =
                     preferences.getInt(
@@ -192,12 +251,79 @@ class WalletMonitoringService : Service() {
                     mutableListOf<BlockScanner.WalletTransaction>()
 
                 val updatedUtxos =
-                    linkedMapOf<Int, List<BlockScanner.SpendableUtxo>>()
+                    linkedMapOf<
+                        Pair<BlockScanner.AddressType, Int>,
+                        List<BlockScanner.SpendableUtxo>
+                    >()
 
-                for (addressIndex in 0..highestAddressIndex) {
-                    val script =
-                        deriveWitnessScript(words, addressIndex)
+                val scanTargets =
+                    buildList {
+                        for (addressIndex in 0..highestAddressIndex) {
+                            add(
+                                Triple(
+                                    BlockScanner.AddressType.STANDARD,
+                                    addressIndex,
+                                    deriveWitnessScript(
+                                        words,
+                                        addressIndex
+                                    )
+                                )
+                            )
+                        }
 
+                        if (
+                            preferences.getBoolean(
+                                PREF_MLDSA_ADDRESS_CREATED,
+                                false
+                            )
+                        ) {
+                            for (
+                                addressIndex in
+                                    0..highestMldsaAddressIndex
+                            ) {
+                                add(
+                                    Triple(
+                                        BlockScanner.AddressType.MLDSA,
+                                        addressIndex,
+                                        derivePqWitnessScript(
+                                            words,
+                                            BlockScanner.AddressType.MLDSA,
+                                            addressIndex
+                                        )
+                                    )
+                                )
+                            }
+                        }
+
+                        if (
+                            preferences.getBoolean(
+                                PREF_SLHDSA_ADDRESS_CREATED,
+                                false
+                            )
+                        ) {
+                            for (
+                                addressIndex in
+                                    0..highestSlhdsaAddressIndex
+                            ) {
+                                add(
+                                    Triple(
+                                        BlockScanner.AddressType.SLHDSA,
+                                        addressIndex,
+                                        derivePqWitnessScript(
+                                            words,
+                                            BlockScanner.AddressType.SLHDSA,
+                                            addressIndex
+                                        )
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                for (
+                    (addressType, addressIndex, script)
+                    in scanTargets
+                ) {
                     val filters =
                         CompactFilterClient.scan(
                             this,
@@ -212,6 +338,7 @@ class WalletMonitoringService : Service() {
                         } else {
                             loadBackgroundUtxos(
                                 preferences,
+                                addressType,
                                 addressIndex
                             )
                         }
@@ -223,13 +350,15 @@ class WalletMonitoringService : Service() {
                             filters.matchingHeights,
                             script,
                             addressIndex,
+                            addressType = addressType,
                             initialUtxos = initialUtxos
                         ) { _, _ -> }
 
                     allTransactions.addAll(blocks.transactions)
 
-                    updatedUtxos[addressIndex] =
-                        blocks.utxos
+                    updatedUtxos[
+                        addressType to addressIndex
+                    ] = blocks.utxos
                 }
 
                 val mergedTransactions =
@@ -297,15 +426,16 @@ class WalletMonitoringService : Service() {
                 )
 
                 for (
-                    addressIndex in 0..highestAddressIndex
+                    (target, utxos) in updatedUtxos
                 ) {
+                    val (addressType, addressIndex) = target
+
                     editor.putStringSet(
-                        PREF_BACKGROUND_UTXO_PREFIX +
-                            addressIndex,
-                        encodeBackgroundUtxos(
-                            updatedUtxos[addressIndex]
-                                ?: emptyList()
-                        )
+                        backgroundUtxoKey(
+                            addressType,
+                            addressIndex
+                        ),
+                        encodeBackgroundUtxos(utxos)
                     )
                 }
 
@@ -536,25 +666,47 @@ class WalletMonitoringService : Service() {
                 utxo.value.toString(),
                 utxo.height.toString(),
                 utxo.addressIndex.toString(),
-                utxo.isCoinbase.toString()
+                utxo.isCoinbase.toString(),
+                utxo.addressType.name
             ).joinToString("|")
         }.toSet()
 
     private fun loadBackgroundUtxos(
         preferences: android.content.SharedPreferences,
+        addressType: BlockScanner.AddressType,
         addressIndex: Int
     ): List<BlockScanner.SpendableUtxo> {
+        val newKey =
+            backgroundUtxoKey(
+                addressType,
+                addressIndex
+            )
+
+        val legacyKey =
+            PREF_BACKGROUND_UTXO_PREFIX + addressIndex
+
         val values =
-            preferences.getStringSet(
-                PREF_BACKGROUND_UTXO_PREFIX + addressIndex,
+            if (preferences.contains(newKey)) {
+                preferences.getStringSet(
+                    newKey,
+                    emptySet()
+                ) ?: emptySet()
+            } else if (
+                addressType == BlockScanner.AddressType.STANDARD
+            ) {
+                preferences.getStringSet(
+                    legacyKey,
+                    emptySet()
+                ) ?: emptySet()
+            } else {
                 emptySet()
-            ) ?: emptySet()
+            }
 
         return values.mapNotNull { value ->
             try {
                 val parts = value.split("|")
 
-                if (parts.size != 6) {
+                if (parts.size != 6 && parts.size != 7) {
                     return@mapNotNull null
                 }
 
@@ -564,7 +716,13 @@ class WalletMonitoringService : Service() {
                     value = parts[2].toLong(),
                     height = parts[3].toInt(),
                     addressIndex = parts[4].toInt(),
-                    isCoinbase = parts[5].toBooleanStrict()
+                    isCoinbase = parts[5].toBooleanStrict(),
+                    addressType =
+                        if (parts.size == 7) {
+                            BlockScanner.AddressType.valueOf(parts[6])
+                        } else {
+                            BlockScanner.AddressType.STANDARD
+                        }
                 )
             } catch (_: Exception) {
                 null
@@ -617,6 +775,129 @@ class WalletMonitoringService : Service() {
 
         return cipher.doFinal(ciphertext)
             .toString(Charsets.UTF_8)
+    }
+
+    private fun derivePqWitnessScript(
+        words: List<String>,
+        addressType: BlockScanner.AddressType,
+        addressIndex: Int
+    ): ByteArray {
+        require(
+            addressType == BlockScanner.AddressType.MLDSA ||
+                addressType == BlockScanner.AddressType.SLHDSA
+        )
+        require(addressIndex >= 0)
+
+        MnemonicCode.INSTANCE.check(words)
+
+        val bip39Seed =
+            MnemonicCode.toSeed(words, "")
+
+        val masterKey =
+            HDKeyDerivation.createMasterPrivateKey(
+                bip39Seed
+            )
+
+        val walletSeed =
+            masterKey.privKeyBytes
+
+        val domain =
+            "Vexta-PQ-HD-v1"
+                .toByteArray(Charsets.US_ASCII)
+
+        val data =
+            ByteArray(domain.size + 1 + 4)
+
+        System.arraycopy(
+            domain,
+            0,
+            data,
+            0,
+            domain.size
+        )
+
+        var offset = domain.size
+
+        data[offset++] =
+            when (addressType) {
+                BlockScanner.AddressType.MLDSA -> 2
+                BlockScanner.AddressType.SLHDSA -> 3
+                BlockScanner.AddressType.STANDARD ->
+                    error("Standard address is not PQ")
+            }.toByte()
+
+        data[offset++] =
+            ((addressIndex ushr 24) and 0xff).toByte()
+        data[offset++] =
+            ((addressIndex ushr 16) and 0xff).toByte()
+        data[offset++] =
+            ((addressIndex ushr 8) and 0xff).toByte()
+        data[offset] =
+            (addressIndex and 0xff).toByte()
+
+        val mac =
+            javax.crypto.Mac.getInstance(
+                "HmacSHA512"
+            )
+
+        mac.init(
+            javax.crypto.spec.SecretKeySpec(
+                walletSeed,
+                "HmacSHA512"
+            )
+        )
+
+        val seedMaterial =
+            mac.doFinal(data)
+
+        val keyPair =
+            when (addressType) {
+                BlockScanner.AddressType.MLDSA ->
+                    requireNotNull(
+                        VextaPQ.mldsaKeypairFromSeed(
+                            seedMaterial
+                        )
+                    )
+
+                BlockScanner.AddressType.SLHDSA ->
+                    requireNotNull(
+                        VextaPQ.sphincsKeypairFromSeed(
+                            seedMaterial
+                        )
+                    )
+
+                BlockScanner.AddressType.STANDARD ->
+                    error("Standard address is not PQ")
+            }
+
+        require(keyPair.size == 2)
+
+        val publicKey = keyPair[0]
+        val secretKey = keyPair[1]
+
+        return try {
+            val keyId =
+                java.security.MessageDigest
+                    .getInstance("SHA-256")
+                    .digest(publicKey)
+
+            byteArrayOf(
+                if (
+                    addressType ==
+                        BlockScanner.AddressType.MLDSA
+                ) {
+                    0x52.toByte()
+                } else {
+                    0x53.toByte()
+                },
+                0x20
+            ) + keyId
+        } finally {
+            secretKey.fill(0)
+            seedMaterial.fill(0)
+            walletSeed.fill(0)
+            bip39Seed.fill(0)
+        }
     }
 
     private fun deriveWitnessScript(

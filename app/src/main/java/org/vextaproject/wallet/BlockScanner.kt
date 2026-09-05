@@ -23,13 +23,20 @@ object BlockScanner {
     private const val genesisHash =
         "0000027626959d894ae1c8a6f9050cdcbdf58eb0037ab06345cb5502955370f1"
 
+    enum class AddressType {
+        STANDARD,
+        MLDSA,
+        SLHDSA
+    }
+
     data class SpendableUtxo(
         val txid: String,
         val outputIndex: Long,
         val value: Long,
         val height: Int,
         val addressIndex: Int,
-        val isCoinbase: Boolean
+        val isCoinbase: Boolean,
+        val addressType: AddressType = AddressType.STANDARD
     )
 
     data class WalletTransaction(
@@ -59,7 +66,8 @@ object BlockScanner {
         val value: Long,
         val height: Int,
         val addressIndex: Int,
-        val isCoinbase: Boolean
+        val isCoinbase: Boolean,
+        val addressType: AddressType
     )
 
     private data class ParsedTransaction(
@@ -86,13 +94,17 @@ object BlockScanner {
         matchingHeights: List<Int>,
         walletScript: ByteArray,
         addressIndex: Int,
+        addressType: AddressType = AddressType.STANDARD,
         initialUtxos: List<SpendableUtxo> = emptyList(),
         progress: (Int, Int) -> Unit
     ): Result {
         if (matchingHeights.isEmpty()) {
             val existing =
                 initialUtxos
-                    .filter { it.addressIndex == addressIndex }
+                    .filter {
+                        it.addressIndex == addressIndex &&
+                            it.addressType == addressType
+                    }
                     .sortedWith(
                         compareBy<SpendableUtxo> { it.height }
                             .thenBy { it.txid }
@@ -128,7 +140,10 @@ object BlockScanner {
         val utxos = linkedMapOf<String, Utxo>()
 
         initialUtxos
-            .filter { it.addressIndex == addressIndex }
+            .filter {
+                        it.addressIndex == addressIndex &&
+                            it.addressType == addressType
+                    }
             .forEach { existing ->
                 val txidWire =
                     existing.txid
@@ -144,7 +159,8 @@ object BlockScanner {
                         value = existing.value,
                         height = existing.height,
                         addressIndex = existing.addressIndex,
-                        isCoinbase = existing.isCoinbase
+                        isCoinbase = existing.isCoinbase,
+                        addressType = existing.addressType
                     )
             }
         var receivedTransactions = 0
@@ -241,7 +257,8 @@ object BlockScanner {
                                         value = transactionOutput.value,
                                         height = height,
                                         addressIndex = addressIndex,
-                                        isCoinbase = transaction.isCoinbase
+                                        isCoinbase = transaction.isCoinbase,
+                                        addressType = addressType
                                     )
 
                                     receivedWalletValue +=
@@ -290,7 +307,8 @@ object BlockScanner {
                                         value = utxo.value,
                                         height = utxo.height,
                                         addressIndex = utxo.addressIndex,
-                                        isCoinbase = utxo.isCoinbase
+                                        isCoinbase = utxo.isCoinbase,
+                                        addressType = utxo.addressType
                                     )
                                 }
 

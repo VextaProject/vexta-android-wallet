@@ -48,6 +48,13 @@ object VextaTransactionSender {
         val fee: Long
     )
 
+    data class PqSigningKey(
+        val addressType: BlockScanner.AddressType,
+        val publicKey: ByteArray,
+        val secretKey: ByteArray
+    )
+
+
     private const val COINBASE_MATURITY = 100
 
     private fun validateCoinbaseMaturity(
@@ -90,9 +97,9 @@ object VextaTransactionSender {
             Math.addExact(sum, utxo.value)
         }
 
-        val fee = estimateFee(
-            inputCount = spendableUtxos.size,
-            outputCount = 1
+        val fee = estimateFeeFromOutputVirtualBytes(
+            inputs = spendableUtxos,
+            outputVirtualBytes = listOf(43L)
         )
 
         val amount = total - fee
@@ -112,6 +119,8 @@ object VextaTransactionSender {
         recipientAddress: String,
         amountSatoshis: Long,
         privateKeysByIndex: Map<Int, ECKey>,
+        pqSigningKeys:
+            Map<Pair<BlockScanner.AddressType, Int>, PqSigningKey>,
         changePubKeyHash: ByteArray,
         chainHeight: Int
     ): CreatedTransaction {
@@ -127,19 +136,32 @@ object VextaTransactionSender {
             "Invalid change public-key hash"
         }
 
-        require(privateKeysByIndex.isNotEmpty()) {
-            "No wallet private keys supplied"
+        require(
+            privateKeysByIndex.isNotEmpty() ||
+                pqSigningKeys.isNotEmpty()
+        ) {
+            "No wallet signing keys supplied"
         }
 
         val recipientScript = addressToScript(recipientAddress)
         val changeScript =
             byteArrayOf(0x00, 0x14) + changePubKeyHash
 
-        val orderedUtxos = spendableUtxos.sortedWith(
-            compareBy<BlockScanner.SpendableUtxo> { it.height }
-                .thenBy { it.txid }
-                .thenBy { it.outputIndex }
-        )
+        val orderedUtxos =
+            spendableUtxos
+                .sortedWith(
+                    compareBy<BlockScanner.SpendableUtxo> {
+                        it.height
+                    }
+                        .thenBy { it.txid }
+                        .thenBy { it.outputIndex }
+                )
+
+        if (orderedUtxos.isEmpty()) {
+            throw IllegalStateException(
+                "No spendable outputs available"
+            )
+        }
 
         val maxSpend =
             calculateMaxSpend(
@@ -172,8 +194,11 @@ object VextaTransactionSender {
                     Math.addExact(selectedValue, utxo.value)
 
                 val estimatedFee = estimateFee(
-                    inputCount = selected.size,
-                    outputCount = 2
+                    inputs = selected,
+                    outputScripts = listOf(
+                        recipientScript,
+                        changeScript
+                    )
                 )
 
                 if (
@@ -191,8 +216,11 @@ object VextaTransactionSender {
             }
 
             fee = estimateFee(
-                inputCount = selected.size,
-                outputCount = 2
+                inputs = selected,
+                outputScripts = listOf(
+                    recipientScript,
+                    changeScript
+                )
             )
 
             if (selectedValue < amountSatoshis + fee) {
@@ -267,37 +295,127 @@ object VextaTransactionSender {
         }
 
         selected.forEachIndexed { index, utxo ->
-            val privateKey =
-                privateKeysByIndex[utxo.addressIndex]
-                    ?: throw IllegalStateException(
-                        "Missing private key for address index " +
-                            utxo.addressIndex
-                    )
+            when (utxo.addressType) {
+                BlockScanner.AddressType.STANDARD -> {
+                    val privateKey =
+                        privateKeysByIndex[utxo.addressIndex]
+                            ?: throw IllegalStateException(
+                                "Missing private key for address index " +
+                                    utxo.addressIndex
+                            )
 
-            val walletPubKeyHash =
-                Utils.sha256hash160(privateKey.pubKey)
+                    val walletPubKeyHash =
+                        Utils.sha256hash160(privateKey.pubKey)
 
-            val scriptCode =
-                ScriptBuilder.createP2PKHOutputScript(
-                    walletPubKeyHash
-                )
+                    val scriptCode =
+                        ScriptBuilder.createP2PKHOutputScript(
+                            walletPubKeyHash
+                        )
 
-            val signature =
-                transaction.calculateWitnessSignature(
-                    index,
-                    privateKey,
-                    scriptCode,
-                    Coin.valueOf(utxo.value),
-                    Transaction.SigHash.ALL,
-                    false
-                )
+                    val signature =
+                        transaction.calculateWitnessSignature(
+                            index,
+                            privateKey,
+                            scriptCode,
+                            Coin.valueOf(utxo.value),
+                            Transaction.SigHash.ALL,
+                            false
+                        )
 
-            transaction.getInput(index.toLong()).setWitness(
-                TransactionWitness.redeemP2WPKH(
-                    signature,
-                    privateKey
-                )
-            )
+                    transaction
+                        .getInput(index.toLong())
+                        .setWitness(
+                            TransactionWitness.redeemP2WPKH(
+                                signature,
+                                privateKey
+                            )
+                        )
+                }
+
+                BlockScanner.AddressType.MLDSA,
+                BlockScanner.AddressType.SLHDSA -> {
+                    val pqKey =
+                        pqSigningKeys[
+                            utxo.addressType to
+                                utxo.addressIndex
+                        ] ?: throw IllegalStateException(
+                            "Missing PQ signing key for " +
+                                "${utxo.addressType} address index " +
+                                utxo.addressIndex
+                        )
+
+                    require(
+                        pqKey.addressType == utxo.addressType
+                    ) {
+                        "PQ signing key type mismatch"
+                    }
+
+                    val witnessVersion =
+                        when (utxo.addressType) {
+                            BlockScanner.AddressType.MLDSA -> 2
+                            BlockScanner.AddressType.SLHDSA -> 3
+                            BlockScanner.AddressType.STANDARD ->
+                                error("Standard input is not PQ")
+                        }
+
+                    val witnessProgram =
+                        MessageDigest
+                            .getInstance("SHA-256")
+                            .digest(pqKey.publicKey)
+
+                    val signatureHash =
+                        calculatePqrSignatureHash(
+                            selected = selected,
+                            outputs = outputs,
+                            inputIndex = index,
+                            witnessVersion = witnessVersion,
+                            witnessProgram = witnessProgram,
+                            amount = utxo.value,
+                            version = 2,
+                            lockTime = 0L,
+                            inputSequence = sequence
+                        )
+
+                    val signature =
+                        try {
+                            when (utxo.addressType) {
+                                BlockScanner.AddressType.MLDSA ->
+                                    requireNotNull(
+                                        VextaPQ.mldsaSign(
+                                            signatureHash,
+                                            pqKey.secretKey
+                                        )
+                                    ) {
+                                        "ML-DSA signing failed"
+                                    }
+
+                                BlockScanner.AddressType.SLHDSA ->
+                                    requireNotNull(
+                                        VextaPQ.sphincsSign(
+                                            signatureHash,
+                                            pqKey.secretKey
+                                        )
+                                    ) {
+                                        "SLH-DSA signing failed"
+                                    }
+
+                                BlockScanner.AddressType.STANDARD ->
+                                    error("Standard input is not PQ")
+                            }
+                        } finally {
+                            pqKey.secretKey.fill(0)
+                        }
+
+                    transaction
+                        .getInput(index.toLong())
+                        .setWitness(
+                            createPqWitness(
+                                signature,
+                                pqKey.publicKey
+                            )
+                        )
+                }
+            }
         }
 
         val rawTransaction =
@@ -338,6 +456,468 @@ object VextaTransactionSender {
         }
 
         return successfulPeers
+    }
+
+    private fun calculatePqrSignatureHash(
+        selected: List<BlockScanner.SpendableUtxo>,
+        outputs: List<TransactionOutputData>,
+        inputIndex: Int,
+        witnessVersion: Int,
+        witnessProgram: ByteArray,
+        amount: Long,
+        version: Int = 2,
+        lockTime: Long = 0L,
+        inputSequence: Long = sequence
+    ): ByteArray {
+        require(inputIndex in selected.indices) {
+            "Invalid PQR input index"
+        }
+
+        require(witnessVersion == 2 || witnessVersion == 3) {
+            "Invalid PQR witness version"
+        }
+
+        require(witnessProgram.size == 32) {
+            "Invalid PQR witness program"
+        }
+
+        val hashPrevouts = doubleSha256(
+            ByteArrayOutputStream().apply {
+                selected.forEach { utxo ->
+                    write(hashDisplayToWire(utxo.txid))
+                    writeUInt32LE(this, utxo.outputIndex)
+                }
+            }.toByteArray()
+        )
+
+        val hashSequence = doubleSha256(
+            ByteArrayOutputStream().apply {
+                selected.forEach {
+                    writeUInt32LE(this, inputSequence)
+                }
+            }.toByteArray()
+        )
+
+        val hashOutputs = doubleSha256(
+            ByteArrayOutputStream().apply {
+                outputs.forEach { transactionOutput ->
+                    writeInt64LE(this, transactionOutput.value)
+                    writeCompactSize(
+                        this,
+                        transactionOutput.script.size.toLong()
+                    )
+                    write(transactionOutput.script)
+                }
+            }.toByteArray()
+        )
+
+        val currentInput = selected[inputIndex]
+
+        val scriptCode =
+            byteArrayOf(
+                if (witnessVersion == 2) {
+                    0x52
+                } else {
+                    0x53
+                },
+                0x20
+            ) + witnessProgram
+
+        val preimage = ByteArrayOutputStream().apply {
+            write(0x00)
+            writeInt32LE(this, version)
+
+            write(hashPrevouts)
+            write(hashSequence)
+
+            write(hashDisplayToWire(currentInput.txid))
+            writeUInt32LE(this, currentInput.outputIndex)
+
+            writeCompactSize(this, scriptCode.size.toLong())
+            write(scriptCode)
+
+            writeInt64LE(this, amount)
+            writeUInt32LE(this, inputSequence)
+
+            write(hashOutputs)
+
+            writeUInt32LE(this, lockTime)
+            writeUInt32LE(this, 1L)
+        }.toByteArray()
+
+        return doubleSha256(preimage)
+    }
+
+    fun runPqrSignatureHashSelfTest(): Pair<String, String> {
+        val selected = listOf(
+            BlockScanner.SpendableUtxo(
+                txid =
+                    "0000000000000000000000000000000000000000000000000000000000000001",
+                outputIndex = 3L,
+                value = 987654L,
+                height = 1,
+                addressIndex = 0,
+                isCoinbase = false,
+                addressType = BlockScanner.AddressType.MLDSA
+            )
+        )
+
+        val outputs = listOf(
+            TransactionOutputData(
+                value = 123456L,
+                script = byteArrayOf(0x51)
+            )
+        )
+
+        val program =
+            ByteArray(32) { index ->
+                index.toByte()
+            }
+
+        val v2 = calculatePqrSignatureHash(
+            selected = selected,
+            outputs = outputs,
+            inputIndex = 0,
+            witnessVersion = 2,
+            witnessProgram = program,
+            amount = 987654L,
+            version = 2,
+            lockTime = 500L,
+            inputSequence = 0xfffffffeL
+        )
+
+        val v3 = calculatePqrSignatureHash(
+            selected = selected,
+            outputs = outputs,
+            inputIndex = 0,
+            witnessVersion = 3,
+            witnessProgram = program,
+            amount = 987654L,
+            version = 2,
+            lockTime = 500L,
+            inputSequence = 0xfffffffeL
+        )
+
+        val v2CoreHex = v2.reversedArray().toHex()
+        val v3CoreHex = v3.reversedArray().toHex()
+
+        check(
+            v2CoreHex ==
+                "ba39c447b4577db974473a1e7ed2182686672f2900045a40aee6b4dc5811995b"
+        ) {
+            "PQR V2 signature hash self-test failed: $v2CoreHex"
+        }
+
+        check(
+            v3CoreHex ==
+                "dab3188530f1094ef87087451da77bfba77dfc6e63d1730bb9d0475cebe76618"
+        ) {
+            "PQR V3 signature hash self-test failed: $v3CoreHex"
+        }
+
+        return v2CoreHex to v3CoreHex
+    }
+
+    private fun createPqWitness(
+        signature: ByteArray,
+        publicKey: ByteArray
+    ): TransactionWitness {
+        require(signature.isNotEmpty()) {
+            "PQ signature is empty"
+        }
+
+        require(publicKey.isNotEmpty()) {
+            "PQ public key is empty"
+        }
+
+        return TransactionWitness(2).apply {
+            setPush(0, signature)
+            setPush(1, publicKey)
+        }
+    }
+
+    fun runPqWitnessSelfTest(): List<String> {
+        val seed =
+            ByteArray(64) { index ->
+                index.toByte()
+            }
+
+        val mldsa =
+            requireNotNull(
+                VextaPQ.mldsaKeypairFromSeed(seed)
+            )
+
+        val sphincs =
+            requireNotNull(
+                VextaPQ.sphincsKeypairFromSeed(seed)
+            )
+
+        val message =
+            "Vexta PQ witness self-test"
+                .toByteArray(Charsets.UTF_8)
+
+        val mldsaSignature =
+            requireNotNull(
+                VextaPQ.mldsaSign(
+                    message,
+                    mldsa[1]
+                )
+            )
+
+        val sphincsSignature =
+            requireNotNull(
+                VextaPQ.sphincsSign(
+                    message,
+                    sphincs[1]
+                )
+            )
+
+        val mldsaWitness =
+            createPqWitness(
+                mldsaSignature,
+                mldsa[0]
+            )
+
+        val sphincsWitness =
+            createPqWitness(
+                sphincsSignature,
+                sphincs[0]
+            )
+
+        check(mldsaWitness.pushCount == 2)
+        check(mldsaWitness.getPush(0).size == 3309)
+        check(mldsaWitness.getPush(1).size == 1952)
+
+        check(sphincsWitness.pushCount == 2)
+        check(sphincsWitness.getPush(0).size == 7856)
+        check(sphincsWitness.getPush(1).size == 32)
+
+        mldsa[1].fill(0)
+        sphincs[1].fill(0)
+
+        return listOf(
+            "MLDSA_WITNESS_PUSHES=${mldsaWitness.pushCount}",
+            "MLDSA_SIG_BYTES=${mldsaWitness.getPush(0).size}",
+            "MLDSA_PUBKEY_BYTES=${mldsaWitness.getPush(1).size}",
+            "SLHDSA_WITNESS_PUSHES=${sphincsWitness.pushCount}",
+            "SLHDSA_SIG_BYTES=${sphincsWitness.getPush(0).size}",
+            "SLHDSA_PUBKEY_BYTES=${sphincsWitness.getPush(1).size}",
+            "PQ_WITNESS_RESULT=PASS"
+        )
+    }
+
+    fun runPqSignedTransactionSelfTest(): List<String> {
+        val recipientAddress =
+            "vtx1z6engqms3emse5lycna6yt7gd6svu7nfd28dccr7mfs8s54pz8rysd6lu5u"
+
+        val recipientScript =
+            addressToScript(recipientAddress)
+
+        val changePubKeyHash =
+            ByteArray(20) { index ->
+                (0x40 + index).toByte()
+            }
+
+        val changeScript =
+            byteArrayOf(0x00, 0x14) + changePubKeyHash
+
+        val amountSatoshis = 100_000L
+        val utxoValue = 10_000_000L
+
+        fun testType(
+            addressType: BlockScanner.AddressType,
+            witnessVersion: Int,
+            expectedSignatureBytes: Int,
+            expectedPublicKeyBytes: Int,
+            txidSuffix: String
+        ): List<String> {
+            val seed =
+                ByteArray(64) { index ->
+                    index.toByte()
+                }
+
+            val keyPair =
+                when (addressType) {
+                    BlockScanner.AddressType.MLDSA ->
+                        requireNotNull(
+                            VextaPQ.mldsaKeypairFromSeed(seed)
+                        )
+
+                    BlockScanner.AddressType.SLHDSA ->
+                        requireNotNull(
+                            VextaPQ.sphincsKeypairFromSeed(seed)
+                        )
+
+                    BlockScanner.AddressType.STANDARD ->
+                        error("Standard is not a PQ self-test type")
+                }
+
+            require(keyPair.size == 2)
+
+            val publicKey = keyPair[0]
+            val secretKey = keyPair[1]
+
+            val syntheticTxid =
+                txidSuffix.padStart(64, '0')
+
+            val utxo =
+                BlockScanner.SpendableUtxo(
+                    txid = syntheticTxid,
+                    outputIndex = 0L,
+                    value = utxoValue,
+                    height = 1,
+                    addressIndex = 0,
+                    isCoinbase = false,
+                    addressType = addressType
+                )
+
+            val pqSigningKeys =
+                mapOf(
+                    (addressType to 0) to
+                        PqSigningKey(
+                            addressType = addressType,
+                            publicKey = publicKey,
+                            secretKey = secretKey
+                        )
+                )
+
+            val created =
+                createAndSign(
+                    spendableUtxos = listOf(utxo),
+                    recipientAddress = recipientAddress,
+                    amountSatoshis = amountSatoshis,
+                    privateKeysByIndex = emptyMap(),
+                    pqSigningKeys = pqSigningKeys,
+                    changePubKeyHash = changePubKeyHash,
+                    chainHeight = 10_000
+                )
+
+            val parsed =
+                Transaction(
+                    MainNetParams.get(),
+                    created.rawTransaction
+                )
+
+            check(parsed.inputs.size == 1)
+
+            val witness =
+                parsed.getInput(0L).getWitness()
+
+            check(witness.pushCount == 2)
+
+            val signature =
+                witness.getPush(0)
+
+            val parsedPublicKey =
+                witness.getPush(1)
+
+            check(signature.size == expectedSignatureBytes)
+            check(parsedPublicKey.size == expectedPublicKeyBytes)
+            check(parsedPublicKey.contentEquals(publicKey))
+
+            check(
+                parsed.txId.toString() ==
+                    created.txid
+            )
+
+            val witnessProgram =
+                MessageDigest
+                    .getInstance("SHA-256")
+                    .digest(publicKey)
+
+            val outputs =
+                mutableListOf(
+                    TransactionOutputData(
+                        value = created.amount,
+                        script = recipientScript
+                    )
+                )
+
+            if (created.change > 0L) {
+                outputs.add(
+                    TransactionOutputData(
+                        value = created.change,
+                        script = changeScript
+                    )
+                )
+            }
+
+            val signatureHash =
+                calculatePqrSignatureHash(
+                    selected = listOf(utxo),
+                    outputs = outputs,
+                    inputIndex = 0,
+                    witnessVersion = witnessVersion,
+                    witnessProgram = witnessProgram,
+                    amount = utxo.value,
+                    version = 2,
+                    lockTime = 0L,
+                    inputSequence = sequence
+                )
+
+            val verified =
+                when (addressType) {
+                    BlockScanner.AddressType.MLDSA ->
+                        VextaPQ.mldsaVerify(
+                            signature,
+                            signatureHash,
+                            publicKey
+                        )
+
+                    BlockScanner.AddressType.SLHDSA ->
+                        VextaPQ.sphincsVerify(
+                            signature,
+                            signatureHash,
+                            publicKey
+                        )
+
+                    BlockScanner.AddressType.STANDARD ->
+                        false
+                }
+
+            check(verified)
+
+            seed.fill(0)
+            signatureHash.fill(0)
+
+            return listOf(
+                "${addressType.name}_SIGNED_TX_BYTES=" +
+                    created.rawTransaction.size,
+                "${addressType.name}_SIGNED_TX_WITNESS_PUSHES=" +
+                    witness.pushCount,
+                "${addressType.name}_SIGNED_TX_SIG_BYTES=" +
+                    signature.size,
+                "${addressType.name}_SIGNED_TX_PUBKEY_BYTES=" +
+                    parsedPublicKey.size,
+                "${addressType.name}_SIGNED_TX_VERIFY=$verified",
+                "${addressType.name}_SIGNED_TX_TXID_MATCH=true"
+            )
+        }
+
+        val results =
+            mutableListOf<String>()
+
+        results +=
+            testType(
+                addressType = BlockScanner.AddressType.MLDSA,
+                witnessVersion = 2,
+                expectedSignatureBytes = 3309,
+                expectedPublicKeyBytes = 1952,
+                txidSuffix = "01"
+            )
+
+        results +=
+            testType(
+                addressType = BlockScanner.AddressType.SLHDSA,
+                witnessVersion = 3,
+                expectedSignatureBytes = 7856,
+                expectedPublicKeyBytes = 32,
+                txidSuffix = "02"
+            )
+
+        results += "PQ_SIGNED_TX_RESULT=PASS"
+
+        return results
     }
 
     private fun serializeTransaction(
@@ -401,14 +981,64 @@ object VextaTransactionSender {
         }.toByteArray()
     }
 
-    private fun estimateFee(
-        inputCount: Int,
-        outputCount: Int
+    private fun estimatedInputVirtualBytes(
+        addressType: BlockScanner.AddressType
     ): Long {
+        return when (addressType) {
+            BlockScanner.AddressType.STANDARD ->
+                69L
+
+            BlockScanner.AddressType.MLDSA ->
+                1358L
+
+            BlockScanner.AddressType.SLHDSA ->
+                2015L
+        }
+    }
+
+    private fun estimatedOutputVirtualBytes(
+        script: ByteArray
+    ): Long {
+        val scriptLengthBytes =
+            when {
+                script.size < 253 -> 1L
+                script.size <= 0xffff -> 3L
+                else -> 5L
+            }
+
+        return 8L +
+            scriptLengthBytes +
+            script.size.toLong()
+    }
+
+    private fun estimateFee(
+        inputs: List<BlockScanner.SpendableUtxo>,
+        outputScripts: List<ByteArray>
+    ): Long {
+        return estimateFeeFromOutputVirtualBytes(
+            inputs = inputs,
+            outputVirtualBytes =
+                outputScripts.map {
+                    estimatedOutputVirtualBytes(it)
+                }
+        )
+    }
+
+    private fun estimateFeeFromOutputVirtualBytes(
+        inputs: List<BlockScanner.SpendableUtxo>,
+        outputVirtualBytes: List<Long>
+    ): Long {
+        val inputVirtualBytes =
+            inputs.sumOf {
+                estimatedInputVirtualBytes(
+                    it.addressType
+                )
+            }
+
         val virtualBytes =
             11L +
-                inputCount * 69L +
-                outputCount * 31L
+                inputVirtualBytes +
+                outputVirtualBytes.sum()
 
         return (
             virtualBytes * defaultFeeSatoshisPerKb + 999L
@@ -419,13 +1049,33 @@ object VextaTransactionSender {
         val value = address.trim()
 
         if (value.lowercase().startsWith("vtx1")) {
-            val witnessProgram = decodeBech32Witness(value)
+            val (witnessVersion, witnessProgram) =
+                decodeBech32Witness(value)
 
-            require(witnessProgram.size == 20) {
-                "Only Vexta P2WPKH addresses are supported"
+            return when (witnessVersion) {
+                0 -> {
+                    require(witnessProgram.size == 20) {
+                        "Only Vexta P2WPKH witness v0 addresses are supported"
+                    }
+                    byteArrayOf(0x00, 0x14) + witnessProgram
+                }
+
+                2 -> {
+                    require(witnessProgram.size == 32) {
+                        "Invalid ML-DSA witness program"
+                    }
+                    byteArrayOf(0x52, 0x20) + witnessProgram
+                }
+
+                3 -> {
+                    require(witnessProgram.size == 32) {
+                        "Invalid SLH-DSA witness program"
+                    }
+                    byteArrayOf(0x53, 0x20) + witnessProgram
+                }
+
+                else -> error("Unsupported witness version")
             }
-
-            return byteArrayOf(0x00, 0x14) + witnessProgram
         }
 
         val decoded = decodeBase58Check(value)
@@ -452,7 +1102,9 @@ object VextaTransactionSender {
             )
     }
 
-    private fun decodeBech32Witness(address: String): ByteArray {
+    private fun decodeBech32Witness(
+        address: String
+    ): Pair<Int, ByteArray> {
         require(address == address.lowercase()) {
             "Mixed-case Bech32 address"
         }
@@ -477,21 +1129,38 @@ object VextaTransactionSender {
             index
         }
 
-        require(bech32Polymod(expandHrp(hrp) + values) == 1) {
-            "Invalid Bech32 checksum"
+        val data = values.dropLast(6)
+        require(data.isNotEmpty()) {
+            "Missing witness version"
         }
 
-        val data = values.dropLast(6)
-        require(data.isNotEmpty() && data[0] == 0) {
+        val witnessVersion = data[0]
+        require(witnessVersion in 0..16) {
             "Unsupported witness version"
         }
 
-        return convertBits(
+        val expectedChecksum =
+            if (witnessVersion == 0) 1 else 0x2bc830a3
+
+        require(
+            bech32Polymod(expandHrp(hrp) + values) ==
+                expectedChecksum
+        ) {
+            if (witnessVersion == 0) {
+                "Invalid Bech32 checksum"
+            } else {
+                "Invalid Bech32m checksum"
+            }
+        }
+
+        val witnessProgram = convertBits(
             data.drop(1),
             5,
             8,
             false
         ).map { it.toByte() }.toByteArray()
+
+        return witnessVersion to witnessProgram
     }
 
     private fun convertBits(

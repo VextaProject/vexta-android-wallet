@@ -97,6 +97,16 @@ class WalletActivity : FragmentActivity() {
             "tx_notifications_initialized"
         private const val PREF_RECEIVE_ADDRESS_INDEX =
             "receive_address_index"
+        private const val PREF_MLDSA_ADDRESS_INDEX =
+            "mldsa_address_index"
+        private const val PREF_SLHDSA_ADDRESS_INDEX =
+            "slhdsa_address_index"
+        private const val PREF_RECEIVE_ADDRESS_TYPE =
+            "receive_address_type"
+        private const val PREF_MLDSA_ADDRESS_CREATED =
+            "mldsa_address_created"
+        private const val PREF_SLHDSA_ADDRESS_CREATED =
+            "slhdsa_address_created"
         private const val PREF_ADDRESS_LABEL_PREFIX =
             "receive_address_label_"
         private const val PREF_RESTORE_ADDRESS_DISCOVERY =
@@ -342,6 +352,13 @@ class WalletActivity : FragmentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        if (
+            applicationInfo.flags and
+                android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0
+        ) {
+            runPqCompatibilitySelfTest()
+        }
+
         onBackPressedDispatcher.addCallback(
             this,
             object : OnBackPressedCallback(true) {
@@ -413,6 +430,450 @@ class WalletActivity : FragmentActivity() {
         }
 
         checkForUpdates()
+    }
+
+    private fun hexToBytes(
+        value: String
+    ): ByteArray {
+        require(value.length % 2 == 0)
+
+        return ByteArray(value.length / 2) { index ->
+            value.substring(
+                index * 2,
+                index * 2 + 2
+            ).toInt(16).toByte()
+        }
+    }
+
+    private fun runPqCompatibilitySelfTest() {
+        Thread {
+            try {
+                val seed = ByteArray(64) { index ->
+                    index.toByte()
+                }
+
+                val mldsa =
+                    requireNotNull(
+                        VextaPQ.mldsaKeypairFromSeed(seed)
+                    )
+
+                val sphincs =
+                    requireNotNull(
+                        VextaPQ.sphincsKeypairFromSeed(seed)
+                    )
+
+                require(mldsa.size == 2)
+                require(sphincs.size == 2)
+
+                fun sha256Hex(data: ByteArray): String =
+                    MessageDigest
+                        .getInstance("SHA-256")
+                        .digest(data)
+                        .joinToString("") { byte ->
+                            "%02x".format(byte.toInt() and 0xff)
+                        }
+
+                val results = listOf(
+                    "MLDSA_PK" to sha256Hex(mldsa[0]),
+                    "MLDSA_SK" to sha256Hex(mldsa[1]),
+                    "SPHINCS_PK" to sha256Hex(sphincs[0]),
+                    "SPHINCS_SK" to sha256Hex(sphincs[1])
+                )
+
+                results.forEach { (name, hash) ->
+                    android.util.Log.i(
+                        "VextaPQTest",
+                        "$name=$hash"
+                    )
+                }
+
+                val passed =
+                    results[0].second ==
+                        "d666806e11cee19a7c989f7445f90dd419cf4d2d51db8c0fdb4c0f0a542238c9" &&
+                    results[1].second ==
+                        "9f1e24f47795fe50040384e3d6183988047170fa2d866406b70fe0a3f8216063" &&
+                    results[2].second ==
+                        "9d5b69aa74c4939468bae5108568a4d0926f2532c96b0742eda0a7eff4c99c3e" &&
+                    results[3].second ==
+                        "c6222658caa895a591af74d9f8c85d160962d253a782edf95875bbb3acee0a07"
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    if (passed) {
+                        "KEYGEN_RESULT=PASS"
+                    } else {
+                        "KEYGEN_RESULT=FAIL"
+                    }
+                )
+
+
+                val mldsaKeyId =
+                    MessageDigest
+                        .getInstance("SHA-256")
+                        .digest(mldsa[0])
+
+                val sphincsKeyId =
+                    MessageDigest
+                        .getInstance("SHA-256")
+                        .digest(sphincs[0])
+
+                val mldsaAddress =
+                    encodeSegwitAddress(
+                        "vtx",
+                        2,
+                        mldsaKeyId
+                    )
+
+                val sphincsAddress =
+                    encodeSegwitAddress(
+                        "vtx",
+                        3,
+                        sphincsKeyId
+                    )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "MLDSA_ADDRESS=$mldsaAddress"
+                )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "SLHDSA_ADDRESS=$sphincsAddress"
+                )
+
+                val addressPassed =
+                    mldsaAddress ==
+                        "vtx1z6engqms3emse5lycna6yt7gd6svu7nfd28dccr7mfs8s54pz8rysd6lu5u" &&
+                    sphincsAddress ==
+                        "vtx1rn4dkn2n5cjfeg696u5gg269y6zfx7ffje94swshd5zn7laxfnslqfc63ay"
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "ADDRESS_RESULT=" +
+                        if (addressPassed) "PASS"
+                        else "FAIL"
+                )
+
+                fun derivePqSeedMaterial(
+                    walletSeed: ByteArray,
+                    algorithm: Int,
+                    counter: Int
+                ): ByteArray {
+                    val domain =
+                        "Vexta-PQ-HD-v1"
+                            .toByteArray(Charsets.US_ASCII)
+
+                    val data = ByteArray(
+                        domain.size + 1 + 4
+                    )
+
+                    System.arraycopy(
+                        domain,
+                        0,
+                        data,
+                        0,
+                        domain.size
+                    )
+
+                    var offset = domain.size
+
+                    data[offset++] =
+                        algorithm.toByte()
+
+                    data[offset++] =
+                        ((counter ushr 24) and 0xff).toByte()
+                    data[offset++] =
+                        ((counter ushr 16) and 0xff).toByte()
+                    data[offset++] =
+                        ((counter ushr 8) and 0xff).toByte()
+                    data[offset] =
+                        (counter and 0xff).toByte()
+
+                    val mac =
+                        javax.crypto.Mac.getInstance(
+                            "HmacSHA512"
+                        )
+
+                    mac.init(
+                        javax.crypto.spec.SecretKeySpec(
+                            walletSeed,
+                            "HmacSHA512"
+                        )
+                    )
+
+                    return mac.doFinal(data)
+                }
+
+                val pqHdWalletSeed =
+                    ByteArray(32) { index ->
+                        index.toByte()
+                    }
+
+                val pqHdVectors = listOf(
+                    "MLDSA_COUNTER_0" to
+                        derivePqSeedMaterial(
+                            pqHdWalletSeed,
+                            2,
+                            0
+                        ),
+                    "MLDSA_COUNTER_1" to
+                        derivePqSeedMaterial(
+                            pqHdWalletSeed,
+                            2,
+                            1
+                        ),
+                    "SLHDSA_COUNTER_0" to
+                        derivePqSeedMaterial(
+                            pqHdWalletSeed,
+                            3,
+                            0
+                        ),
+                    "SLHDSA_COUNTER_1" to
+                        derivePqSeedMaterial(
+                            pqHdWalletSeed,
+                            3,
+                            1
+                        )
+                )
+
+                pqHdVectors.forEach { (name, value) ->
+                    android.util.Log.i(
+                        "VextaPQTest",
+                        "$name=${value.joinToString("") {
+                            "%02x".format(
+                                it.toInt() and 0xff
+                            )
+                        }}"
+                    )
+                }
+
+                val pqHdPassed =
+                    pqHdVectors[0].second.contentEquals(
+                        hexToBytes(
+                            "0b5d81161cee1dd59cba10551b48069b2d38deabaec25ce2553777f2ee1574d8a9b5dd1cc72b84f5a6f97a943a060484b048f7ae06433ef73519c9c47136a8e6"
+                        )
+                    ) &&
+                    pqHdVectors[1].second.contentEquals(
+                        hexToBytes(
+                            "96afee1e425cdc5cef6f2a5e565669e059f77538d432b00598c2ce4dae777de58a9ca26ea8c8f63d54a3b9b25554c9db4f4b2f3ff8a83954db44f94c46c7919b"
+                        )
+                    ) &&
+                    pqHdVectors[2].second.contentEquals(
+                        hexToBytes(
+                            "62789e270793f5ca638ceba587a63c8931e1fa8f6ae300d79219b56351d71899905391fd9739652b11db87176ecba328cbac551b6b685961afe9c35346ec0d34"
+                        )
+                    ) &&
+                    pqHdVectors[3].second.contentEquals(
+                        hexToBytes(
+                            "8e445ae4bb057ce26190c032115adeebbda64f6768904dd56147f4832981fb762e7d683b639c2bff6034c93223f71d3ca3d12bad887cb139d3c62da1f8487fa2"
+                        )
+                    )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "PQ_HD_RESULT=" +
+                        if (pqHdPassed) "PASS"
+                        else "FAIL"
+                )
+
+                val message =
+                    "Vexta PQ Android signature test"
+                        .toByteArray(Charsets.UTF_8)
+
+                val mldsaSignature =
+                    requireNotNull(
+                        VextaPQ.mldsaSign(
+                            message,
+                            mldsa[1]
+                        )
+                    )
+
+                val mldsaVerified =
+                    VextaPQ.mldsaVerify(
+                        mldsaSignature,
+                        message,
+                        mldsa[0]
+                    )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "MLDSA_SIG_BYTES=${mldsaSignature.size}"
+                )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "MLDSA_VERIFY=$mldsaVerified"
+                )
+
+                val sphincsSignature =
+                    requireNotNull(
+                        VextaPQ.sphincsSign(
+                            message,
+                            sphincs[1]
+                        )
+                    )
+
+                val sphincsVerified =
+                    VextaPQ.sphincsVerify(
+                        sphincsSignature,
+                        message,
+                        sphincs[0]
+                    )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "SPHINCS_SIG_BYTES=${sphincsSignature.size}"
+                )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "SPHINCS_VERIFY=$sphincsVerified"
+                )
+
+                java.io.File(
+                    filesDir,
+                    "pq-test-message.bin"
+                ).writeBytes(message)
+
+                java.io.File(
+                    filesDir,
+                    "pq-mldsa.sig"
+                ).writeBytes(mldsaSignature)
+
+                java.io.File(
+                    filesDir,
+                    "pq-sphincs.sig"
+                ).writeBytes(sphincsSignature)
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "SIGNATURE_FILES_WRITTEN=true"
+                )
+
+                val signatureTestPassed =
+                    passed &&
+                    mldsaSignature.size == 3309 &&
+                    mldsaVerified &&
+                    sphincsSignature.size == 7856 &&
+                    sphincsVerified
+
+                val coreMldsaSignature =
+                    assets.open("pq-core-mldsa.sig").use {
+                        it.readBytes()
+                    }
+
+                val coreSphincsSignature =
+                    assets.open("pq-core-sphincs.sig").use {
+                        it.readBytes()
+                    }
+
+                val coreMldsaVerified =
+                    VextaPQ.mldsaVerify(
+                        coreMldsaSignature,
+                        message,
+                        mldsa[0]
+                    )
+
+                val coreSphincsVerified =
+                    VextaPQ.sphincsVerify(
+                        coreSphincsSignature,
+                        message,
+                        sphincs[0]
+                    )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "CORE_TO_ANDROID_MLDSA=$coreMldsaVerified"
+                )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "CORE_TO_ANDROID_SPHINCS=$coreSphincsVerified"
+                )
+
+                val (pqrV2, pqrV3) =
+                    VextaTransactionSender
+                        .runPqrSignatureHashSelfTest()
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "PQR_V2=$pqrV2"
+                )
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "PQR_V3=$pqrV3"
+                )
+
+                val pqrPassed =
+                    pqrV2 ==
+                        "ba39c447b4577db974473a1e7ed2182686672f2900045a40aee6b4dc5811995b" &&
+                    pqrV3 ==
+                        "dab3188530f1094ef87087451da77bfba77dfc6e63d1730bb9d0475cebe76618"
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    "PQR_HASH_RESULT=" +
+                        if (pqrPassed) "PASS"
+                        else "FAIL"
+                )
+
+                val pqWitnessResults =
+                    VextaTransactionSender
+                        .runPqWitnessSelfTest()
+
+                pqWitnessResults.forEach { result ->
+                    android.util.Log.i(
+                        "VextaPQTest",
+                        result
+                    )
+                }
+
+                val pqWitnessPassed =
+                    pqWitnessResults.contains(
+                        "PQ_WITNESS_RESULT=PASS"
+                    )
+
+                val pqSignedTxResults =
+                    VextaTransactionSender
+                        .runPqSignedTransactionSelfTest()
+
+                pqSignedTxResults.forEach { result ->
+                    android.util.Log.i(
+                        "VextaPQTest",
+                        result
+                    )
+                }
+
+                val pqSignedTxPassed =
+                    pqSignedTxResults.contains(
+                        "PQ_SIGNED_TX_RESULT=PASS"
+                    )
+
+                val finalPassed =
+                    signatureTestPassed &&
+                    coreMldsaVerified &&
+                    coreSphincsVerified &&
+                    pqrPassed &&
+                    pqWitnessPassed &&
+                    pqSignedTxPassed
+
+                android.util.Log.i(
+                    "VextaPQTest",
+                    if (finalPassed) {
+                        "RESULT=PASS"
+                    } else {
+                        "RESULT=FAIL"
+                    }
+                )
+            } catch (error: Throwable) {
+                android.util.Log.e(
+                    "VextaPQTest",
+                    "RESULT=ERROR",
+                    error
+                )
+            }
+        }.start()
     }
 
     override fun onResume() {
@@ -1053,38 +1514,122 @@ class WalletActivity : FragmentActivity() {
         editor.apply()
     }
 
+    private fun backgroundUtxoKey(
+        addressType: BlockScanner.AddressType,
+        addressIndex: Int
+    ): String {
+        return PREF_BACKGROUND_UTXO_PREFIX +
+            addressType.name +
+            "_" +
+            addressIndex
+    }
+
     private fun loadCachedWalletUtxos(): List<BlockScanner.SpendableUtxo> {
         val preferences =
             getSharedPreferences(PREFS, MODE_PRIVATE)
 
-        val highestIndex = currentReceiveAddressIndex()
+        val addressRanges =
+            buildList {
+                add(
+                    BlockScanner.AddressType.STANDARD to
+                        (0..currentReceiveAddressIndex())
+                )
 
-        return (0..highestIndex)
-            .flatMap { addressIndex ->
-                val values =
-                    preferences.getStringSet(
-                        PREF_BACKGROUND_UTXO_PREFIX + addressIndex,
-                        emptySet()
-                    ) ?: emptySet()
+                if (
+                    pqAddressCreated(
+                        ReceiveAddressType.MLDSA
+                    )
+                ) {
+                    add(
+                        BlockScanner.AddressType.MLDSA to
+                            (
+                                0..currentPqAddressIndex(
+                                    ReceiveAddressType.MLDSA
+                                )
+                            )
+                    )
+                }
 
-                values.mapNotNull { value ->
-                    try {
-                        val parts = value.split("|")
+                if (
+                    pqAddressCreated(
+                        ReceiveAddressType.SLHDSA
+                    )
+                ) {
+                    add(
+                        BlockScanner.AddressType.SLHDSA to
+                            (
+                                0..currentPqAddressIndex(
+                                    ReceiveAddressType.SLHDSA
+                                )
+                            )
+                    )
+                }
+            }
 
-                        if (parts.size != 6) {
-                            return@mapNotNull null
+        return addressRanges
+            .flatMap { (addressType, indices) ->
+                indices.flatMap { addressIndex ->
+                    val newKey =
+                        backgroundUtxoKey(
+                            addressType,
+                            addressIndex
+                        )
+
+                    val values =
+                        if (
+                            addressType ==
+                                BlockScanner.AddressType.STANDARD &&
+                            !preferences.contains(newKey)
+                        ) {
+                            val legacyKey =
+                                PREF_BACKGROUND_UTXO_PREFIX +
+                                    addressIndex
+
+                            preferences.getStringSet(
+                                legacyKey,
+                                emptySet()
+                            ) ?: emptySet()
+                        } else {
+                            preferences.getStringSet(
+                                newKey,
+                                emptySet()
+                            ) ?: emptySet()
                         }
 
-                        BlockScanner.SpendableUtxo(
-                            txid = parts[0],
-                            outputIndex = parts[1].toLong(),
-                            value = parts[2].toLong(),
-                            height = parts[3].toInt(),
-                            addressIndex = parts[4].toInt(),
-                            isCoinbase = parts[5].toBooleanStrict()
-                        )
-                    } catch (_: Exception) {
-                        null
+                    values.mapNotNull { value ->
+                        try {
+                            val parts = value.split("|")
+
+                            if (
+                                parts.size != 6 &&
+                                parts.size != 7
+                            ) {
+                                return@mapNotNull null
+                            }
+
+                            BlockScanner.SpendableUtxo(
+                                txid = parts[0],
+                                outputIndex =
+                                    parts[1].toLong(),
+                                value =
+                                    parts[2].toLong(),
+                                height =
+                                    parts[3].toInt(),
+                                addressIndex =
+                                    parts[4].toInt(),
+                                isCoinbase =
+                                    parts[5].toBooleanStrict(),
+                                addressType =
+                                    if (parts.size == 7) {
+                                        BlockScanner.AddressType
+                                            .valueOf(parts[6])
+                                    } else {
+                                        BlockScanner.AddressType.STANDARD
+                                    }
+                            )
+                        } catch (_: Exception) {
+                            null
+                        }
                     }
                 }
             }
@@ -1299,6 +1844,307 @@ class WalletActivity : FragmentActivity() {
         )
     }
 
+    private enum class ReceiveAddressType {
+        STANDARD,
+        MLDSA,
+        SLHDSA
+    }
+
+    private data class PqDerivedKey(
+        val address: String,
+        val scriptPubKey: ByteArray,
+        val publicKey: ByteArray,
+        val secretKey: ByteArray
+    )
+
+    private fun derivePqSeedMaterial(
+        words: List<String>,
+        type: ReceiveAddressType,
+        counter: Int
+    ): ByteArray {
+        require(
+            type == ReceiveAddressType.MLDSA ||
+                type == ReceiveAddressType.SLHDSA
+        )
+        require(counter >= 0)
+
+        MnemonicCode.INSTANCE.check(words)
+
+        val bip39Seed =
+            MnemonicCode.toSeed(words, "")
+
+        val masterKey =
+            HDKeyDerivation.createMasterPrivateKey(
+                bip39Seed
+            )
+
+        val walletSeed =
+            masterKey.privKeyBytes
+
+        val domain =
+            "Vexta-PQ-HD-v1"
+                .toByteArray(Charsets.US_ASCII)
+
+        val data =
+            ByteArray(domain.size + 1 + 4)
+
+        System.arraycopy(
+            domain,
+            0,
+            data,
+            0,
+            domain.size
+        )
+
+        var offset = domain.size
+
+        data[offset++] =
+            when (type) {
+                ReceiveAddressType.MLDSA -> 2
+                ReceiveAddressType.SLHDSA -> 3
+                ReceiveAddressType.STANDARD ->
+                    error("Standard address is not PQ")
+            }.toByte()
+
+        data[offset++] =
+            ((counter ushr 24) and 0xff).toByte()
+        data[offset++] =
+            ((counter ushr 16) and 0xff).toByte()
+        data[offset++] =
+            ((counter ushr 8) and 0xff).toByte()
+        data[offset] =
+            (counter and 0xff).toByte()
+
+        return try {
+            val mac =
+                javax.crypto.Mac.getInstance(
+                    "HmacSHA512"
+                )
+
+            mac.init(
+                javax.crypto.spec.SecretKeySpec(
+                    walletSeed,
+                    "HmacSHA512"
+                )
+            )
+
+            mac.doFinal(data)
+        } finally {
+            data.fill(0)
+            walletSeed.fill(0)
+            bip39Seed.fill(0)
+        }
+    }
+
+    private fun derivePqKey(
+        words: List<String>,
+        type: ReceiveAddressType,
+        counter: Int
+    ): PqDerivedKey {
+        val seedMaterial =
+            derivePqSeedMaterial(
+                words,
+                type,
+                counter
+            )
+
+        return try {
+            val keyPair =
+                when (type) {
+                    ReceiveAddressType.MLDSA ->
+                        requireNotNull(
+                            VextaPQ.mldsaKeypairFromSeed(
+                                seedMaterial
+                            )
+                        )
+
+                    ReceiveAddressType.SLHDSA ->
+                        requireNotNull(
+                            VextaPQ.sphincsKeypairFromSeed(
+                                seedMaterial
+                            )
+                        )
+
+                    ReceiveAddressType.STANDARD ->
+                        error("Standard address is not PQ")
+                }
+
+            require(keyPair.size == 2)
+
+            val publicKey = keyPair[0]
+            val secretKey = keyPair[1]
+
+            val keyId =
+                MessageDigest
+                    .getInstance("SHA-256")
+                    .digest(publicKey)
+
+            val witnessVersion =
+                when (type) {
+                    ReceiveAddressType.MLDSA -> 2
+                    ReceiveAddressType.SLHDSA -> 3
+                    ReceiveAddressType.STANDARD ->
+                        error("Standard address is not PQ")
+                }
+
+            val address =
+                encodeSegwitAddress(
+                    "vtx",
+                    witnessVersion,
+                    keyId
+                )
+
+            val scriptPubKey =
+                byteArrayOf(
+                    if (witnessVersion == 2) {
+                        0x52.toByte()
+                    } else {
+                        0x53.toByte()
+                    },
+                    0x20
+                ) + keyId
+
+            PqDerivedKey(
+                address = address,
+                scriptPubKey = scriptPubKey,
+                publicKey = publicKey,
+                secretKey = secretKey
+            )
+        } finally {
+            seedMaterial.fill(0)
+        }
+    }
+
+    private fun currentReceiveAddressType(): ReceiveAddressType {
+        val stored =
+            getSharedPreferences(
+                PREFS,
+                MODE_PRIVATE
+            ).getString(
+                PREF_RECEIVE_ADDRESS_TYPE,
+                ReceiveAddressType.STANDARD.name
+            )
+
+        return try {
+            ReceiveAddressType.valueOf(
+                stored ?: ReceiveAddressType.STANDARD.name
+            )
+        } catch (_: Exception) {
+            ReceiveAddressType.STANDARD
+        }
+    }
+
+    private fun setCurrentReceiveAddressType(
+        type: ReceiveAddressType
+    ) {
+        getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        )
+            .edit()
+            .putString(
+                PREF_RECEIVE_ADDRESS_TYPE,
+                type.name
+            )
+            .apply()
+    }
+
+    private fun pqAddressCreated(
+        type: ReceiveAddressType
+    ): Boolean {
+        val key =
+            when (type) {
+                ReceiveAddressType.MLDSA ->
+                    PREF_MLDSA_ADDRESS_CREATED
+
+                ReceiveAddressType.SLHDSA ->
+                    PREF_SLHDSA_ADDRESS_CREATED
+
+                ReceiveAddressType.STANDARD ->
+                    return true
+            }
+
+        return getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        ).getBoolean(key, false)
+    }
+
+    private fun setPqAddressCreated(
+        type: ReceiveAddressType
+    ) {
+        val key =
+            when (type) {
+                ReceiveAddressType.MLDSA ->
+                    PREF_MLDSA_ADDRESS_CREATED
+
+                ReceiveAddressType.SLHDSA ->
+                    PREF_SLHDSA_ADDRESS_CREATED
+
+                ReceiveAddressType.STANDARD ->
+                    return
+            }
+
+        getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        )
+            .edit()
+            .putBoolean(key, true)
+            .apply()
+    }
+
+    private fun currentPqAddressIndex(
+        type: ReceiveAddressType
+    ): Int {
+        val key =
+            when (type) {
+                ReceiveAddressType.MLDSA ->
+                    PREF_MLDSA_ADDRESS_INDEX
+
+                ReceiveAddressType.SLHDSA ->
+                    PREF_SLHDSA_ADDRESS_INDEX
+
+                ReceiveAddressType.STANDARD ->
+                    error("Standard address has its own index")
+            }
+
+        return getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        )
+            .getInt(key, 0)
+            .coerceAtLeast(0)
+    }
+
+    private fun setCurrentPqAddressIndex(
+        type: ReceiveAddressType,
+        index: Int
+    ) {
+        val key =
+            when (type) {
+                ReceiveAddressType.MLDSA ->
+                    PREF_MLDSA_ADDRESS_INDEX
+
+                ReceiveAddressType.SLHDSA ->
+                    PREF_SLHDSA_ADDRESS_INDEX
+
+                ReceiveAddressType.STANDARD ->
+                    error("Standard address has its own index")
+            }
+
+        getSharedPreferences(
+            PREFS,
+            MODE_PRIVATE
+        )
+            .edit()
+            .putInt(
+                key,
+                index.coerceAtLeast(0)
+            )
+            .apply()
+    }
+
     private fun currentReceiveAddressIndex(): Int {
         return getSharedPreferences(PREFS, MODE_PRIVATE)
             .getInt(PREF_RECEIVE_ADDRESS_INDEX, 0)
@@ -1326,7 +2172,7 @@ class WalletActivity : FragmentActivity() {
                         PREF_RESTORE_ADDRESS_DISCOVERY,
                         false
                     )
-                val highestAddressIndex =
+                val highestStandardAddressIndex =
                     if (restoreAddressDiscovery) {
                         maxOf(
                             currentReceiveAddressIndex(),
@@ -1336,7 +2182,37 @@ class WalletActivity : FragmentActivity() {
                         currentReceiveAddressIndex()
                     }
 
-                var highestUsedAddressIndex = -1
+                val highestMldsaAddressIndex =
+                    if (restoreAddressDiscovery) {
+                        maxOf(
+                            currentPqAddressIndex(
+                                ReceiveAddressType.MLDSA
+                            ),
+                            RESTORE_ADDRESS_LOOKAHEAD
+                        )
+                    } else {
+                        currentPqAddressIndex(
+                            ReceiveAddressType.MLDSA
+                        )
+                    }
+
+                val highestSlhdsaAddressIndex =
+                    if (restoreAddressDiscovery) {
+                        maxOf(
+                            currentPqAddressIndex(
+                                ReceiveAddressType.SLHDSA
+                            ),
+                            RESTORE_ADDRESS_LOOKAHEAD
+                        )
+                    } else {
+                        currentPqAddressIndex(
+                            ReceiveAddressType.SLHDSA
+                        )
+                    }
+
+                var highestUsedStandardAddressIndex = -1
+                var highestUsedMldsaAddressIndex = -1
+                var highestUsedSlhdsaAddressIndex = -1
 
                 val allUtxos =
                     mutableListOf<BlockScanner.SpendableUtxo>()
@@ -1348,30 +2224,124 @@ class WalletActivity : FragmentActivity() {
                 var totalReceivedTransactions = 0
                 var totalSpentTransactions = 0
 
-                for (addressIndex in 0..highestAddressIndex) {
-                    val scriptPubKey =
-                        deriveWitnessScript(words, addressIndex)
+                val scanTargets =
+                    buildList {
+                        for (addressIndex in 0..highestStandardAddressIndex) {
+                            add(
+                                Triple(
+                                    BlockScanner.AddressType.STANDARD,
+                                    addressIndex,
+                                    deriveWitnessScript(
+                                        words,
+                                        addressIndex
+                                    )
+                                )
+                            )
+                        }
+
+                        if (
+                            restoreAddressDiscovery ||
+                            pqAddressCreated(
+                                ReceiveAddressType.MLDSA
+                            )
+                        ) {
+                            for (
+                                addressIndex in
+                                    0..highestMldsaAddressIndex
+                            ) {
+                            val key =
+                                derivePqKey(
+                                    words,
+                                    ReceiveAddressType.MLDSA,
+                                    addressIndex
+                                )
+
+                            val script = key.scriptPubKey
+                            key.secretKey.fill(0)
+
+                                add(
+                                    Triple(
+                                        BlockScanner.AddressType.MLDSA,
+                                        addressIndex,
+                                        script
+                                    )
+                                )
+                            }
+                        }
+
+                        if (
+                            restoreAddressDiscovery ||
+                            pqAddressCreated(
+                                ReceiveAddressType.SLHDSA
+                            )
+                        ) {
+                            for (
+                                addressIndex in
+                                    0..highestSlhdsaAddressIndex
+                            ) {
+                            val key =
+                                derivePqKey(
+                                    words,
+                                    ReceiveAddressType.SLHDSA,
+                                    addressIndex
+                                )
+
+                            val script = key.scriptPubKey
+                            key.secretKey.fill(0)
+
+                                add(
+                                    Triple(
+                                        BlockScanner.AddressType.SLHDSA,
+                                        addressIndex,
+                                        script
+                                    )
+                                )
+                            }
+                        }
+                    }
+
+                val totalAddressesToScan =
+                    scanTargets.size
+
+                scanTargets.forEachIndexed {
+                        targetPosition,
+                        (addressType, addressIndex, scriptPubKey) ->
+
+                    val typeLabel =
+                        when (addressType) {
+                            BlockScanner.AddressType.STANDARD ->
+                                "Standard"
+
+                            BlockScanner.AddressType.MLDSA ->
+                                "ML-DSA"
+
+                            BlockScanner.AddressType.SLHDSA ->
+                                "SLH-DSA"
+                        }
 
                     runOnUiThread {
                         blockchainScanStatus?.text =
-                            "Scanning address " +
-                                "${addressIndex + 1} of " +
-                                "${highestAddressIndex + 1}..."
+                            "Scanning $typeLabel address " +
+                                "${addressIndex + 1}\n" +
+                                "Wallet address " +
+                                "${targetPosition + 1} of " +
+                                "$totalAddressesToScan..."
                     }
 
-                    val filterResult = CompactFilterClient.scan(
-                        this@WalletActivity,
-                        "87.106.99.23",
-                        scriptPubKey
-                    ) { scanned, total ->
-                        runOnUiThread {
-                            blockchainScanStatus?.text =
-                                "Address ${addressIndex + 1}/" +
-                                    "${highestAddressIndex + 1}\n" +
-                                    "Scanning compact filters: " +
-                                    "$scanned / $total"
+                    val filterResult =
+                        CompactFilterClient.scan(
+                            this@WalletActivity,
+                            "87.106.99.23",
+                            scriptPubKey
+                        ) { scanned, total ->
+                            runOnUiThread {
+                                blockchainScanStatus?.text =
+                                    "$typeLabel address " +
+                                        "${addressIndex + 1}\n" +
+                                        "Scanning compact filters: " +
+                                        "$scanned / $total"
+                            }
                         }
-                    }
 
                     totalFiltersScanned +=
                         filterResult.scannedFilters
@@ -1382,33 +2352,57 @@ class WalletActivity : FragmentActivity() {
                             filterResult.localHeaderHeight
                         )
 
-                    val blockResult = BlockScanner.scan(
-                        this@WalletActivity,
-                        "87.106.99.23",
-                        filterResult.matchingHeights,
-                        scriptPubKey,
-                        addressIndex
-                    ) { downloaded, total ->
-                        runOnUiThread {
-                            blockchainScanStatus?.text =
-                                "Address ${addressIndex + 1}/" +
-                                    "${highestAddressIndex + 1}\n" +
-                                    "Relevant blocks downloaded: " +
-                                    "$downloaded / $total"
+                    val blockResult =
+                        BlockScanner.scan(
+                            this@WalletActivity,
+                            "87.106.99.23",
+                            filterResult.matchingHeights,
+                            scriptPubKey,
+                            addressIndex,
+                            addressType = addressType
+                        ) { downloaded, total ->
+                            runOnUiThread {
+                                blockchainScanStatus?.text =
+                                    "$typeLabel address " +
+                                        "${addressIndex + 1}\n" +
+                                        "Relevant blocks downloaded: " +
+                                        "$downloaded / $total"
+                            }
                         }
-                    }
 
                     allUtxos.addAll(blockResult.utxos)
                     allTransactions.addAll(
                         blockResult.transactions
                     )
 
-                    if (
+                    val addressWasUsed =
                         blockResult.receivedTransactions > 0 ||
-                        blockResult.spentTransactions > 0 ||
-                        blockResult.transactions.isNotEmpty()
-                    ) {
-                        highestUsedAddressIndex = addressIndex
+                            blockResult.spentTransactions > 0 ||
+                            blockResult.transactions.isNotEmpty()
+
+                    if (addressWasUsed) {
+                        when (addressType) {
+                            BlockScanner.AddressType.STANDARD ->
+                                highestUsedStandardAddressIndex =
+                                    maxOf(
+                                        highestUsedStandardAddressIndex,
+                                        addressIndex
+                                    )
+
+                            BlockScanner.AddressType.MLDSA ->
+                                highestUsedMldsaAddressIndex =
+                                    maxOf(
+                                        highestUsedMldsaAddressIndex,
+                                        addressIndex
+                                    )
+
+                            BlockScanner.AddressType.SLHDSA ->
+                                highestUsedSlhdsaAddressIndex =
+                                    maxOf(
+                                        highestUsedSlhdsaAddressIndex,
+                                        addressIndex
+                                    )
+                        }
                     }
 
                     totalRelevantBlocks +=
@@ -1528,9 +2522,52 @@ class WalletActivity : FragmentActivity() {
 
                 if (restoreAddressDiscovery) {
                     setCurrentReceiveAddressIndex(
-                        highestUsedAddressIndex.coerceAtLeast(0)
+                        highestUsedStandardAddressIndex.coerceAtLeast(0)
                     )
+
+                    if (highestUsedMldsaAddressIndex >= 0) {
+                        setCurrentPqAddressIndex(
+                            ReceiveAddressType.MLDSA,
+                            highestUsedMldsaAddressIndex
+                        )
+                        setPqAddressCreated(
+                            ReceiveAddressType.MLDSA
+                        )
+                    } else {
+                        setCurrentPqAddressIndex(
+                            ReceiveAddressType.MLDSA,
+                            0
+                        )
+                    }
+
+                    if (highestUsedSlhdsaAddressIndex >= 0) {
+                        setCurrentPqAddressIndex(
+                            ReceiveAddressType.SLHDSA,
+                            highestUsedSlhdsaAddressIndex
+                        )
+                        setPqAddressCreated(
+                            ReceiveAddressType.SLHDSA
+                        )
+                    } else {
+                        setCurrentPqAddressIndex(
+                            ReceiveAddressType.SLHDSA,
+                            0
+                        )
+                    }
+
+                    setCurrentReceiveAddressType(
+                        ReceiveAddressType.STANDARD
+                    )
+
                     preferences.edit()
+                        .putBoolean(
+                            PREF_MLDSA_ADDRESS_CREATED,
+                            highestUsedMldsaAddressIndex >= 0
+                        )
+                        .putBoolean(
+                            PREF_SLHDSA_ADDRESS_CREATED,
+                            highestUsedSlhdsaAddressIndex >= 0
+                        )
                         .putBoolean(
                             PREF_RESTORE_ADDRESS_DISCOVERY,
                             false
@@ -1562,7 +2599,7 @@ class WalletActivity : FragmentActivity() {
 
                     blockchainScanStatus?.text =
                         "Addresses scanned: " +
-                            "${highestAddressIndex + 1}\n" +
+                            "$totalAddressesToScan\n" +
                             "Filters scanned: $totalFiltersScanned\n" +
                             "Relevant blocks: $totalRelevantBlocks\n" +
                             "Received transactions: " +
@@ -2105,6 +3142,8 @@ class WalletActivity : FragmentActivity() {
     }
 
     private fun showSeedLengthDialog() {
+        lateinit var dialog: AlertDialog
+
         val content = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(
@@ -2116,6 +3155,7 @@ class WalletActivity : FragmentActivity() {
 
             addView(
                 primaryButton("12-word recovery phrase") {
+                    dialog.dismiss()
                     createNewWallet(12)
                 }
             )
@@ -2124,19 +3164,23 @@ class WalletActivity : FragmentActivity() {
 
             addView(
                 primaryButton("24-word recovery phrase") {
+                    dialog.dismiss()
                     createNewWallet(24)
                 }
             )
         }
 
-        AlertDialog.Builder(this)
-            .setTitle("Recovery phrase length")
-            .setMessage(
-                "Choose the recovery phrase length for your new wallet."
-            )
-            .setView(content)
-            .setNegativeButton("Cancel", null)
-            .show()
+        dialog =
+            AlertDialog.Builder(this)
+                .setTitle("Recovery phrase length")
+                .setMessage(
+                    "Choose the recovery phrase length for your new wallet."
+                )
+                .setView(content)
+                .setNegativeButton("Cancel", null)
+                .create()
+
+        dialog.show()
     }
 
     private fun createNewWallet(wordCount: Int) {
@@ -2159,9 +3203,40 @@ class WalletActivity : FragmentActivity() {
 
         saveMnemonic(words.joinToString(" "))
 
-        getSharedPreferences(PREFS, MODE_PRIVATE)
-            .edit()
+        val preferences =
+            getSharedPreferences(PREFS, MODE_PRIVATE)
+
+        val editor = preferences.edit()
+
+        preferences.all.keys
+            .filter {
+                it.startsWith(
+                    PREF_BACKGROUND_UTXO_PREFIX
+                )
+            }
+            .forEach {
+                editor.remove(it)
+            }
+
+        editor
+            .remove(PREF_BACKGROUND_TX_HISTORY)
+            .remove(PREF_LAST_BACKGROUND_SCAN_HEIGHT)
+            .remove(PREF_KNOWN_INCOMING_TXIDS)
+            .remove(PREF_OUTGOING_TRANSACTIONS)
             .putBoolean(PREF_BACKUP_CONFIRMED, false)
+            .putInt(PREF_RECEIVE_ADDRESS_INDEX, 0)
+            .putInt(PREF_MLDSA_ADDRESS_INDEX, 0)
+            .putInt(PREF_SLHDSA_ADDRESS_INDEX, 0)
+            .putBoolean(PREF_MLDSA_ADDRESS_CREATED, false)
+            .putBoolean(PREF_SLHDSA_ADDRESS_CREATED, false)
+            .putString(
+                PREF_RECEIVE_ADDRESS_TYPE,
+                ReceiveAddressType.STANDARD.name
+            )
+            .putBoolean(
+                PREF_RESTORE_ADDRESS_DISCOVERY,
+                false
+            )
             .apply()
 
         showSeedBackup(words)
@@ -2831,8 +3906,65 @@ class WalletActivity : FragmentActivity() {
             return
         }
 
-        val addressIndex = currentReceiveAddressIndex()
-        val address = deriveAddress(words, addressIndex)
+        val receiveType =
+            currentReceiveAddressType()
+
+        val addressIndex: Int
+        val address: String
+        val typeLabel: String
+
+        when (receiveType) {
+            ReceiveAddressType.STANDARD -> {
+                addressIndex =
+                    currentReceiveAddressIndex()
+
+                address =
+                    deriveAddress(
+                        words,
+                        addressIndex
+                    )
+
+                typeLabel = "Standard"
+            }
+
+            ReceiveAddressType.MLDSA -> {
+                addressIndex =
+                    currentPqAddressIndex(
+                        ReceiveAddressType.MLDSA
+                    )
+
+                val key =
+                    derivePqKey(
+                        words,
+                        ReceiveAddressType.MLDSA,
+                        addressIndex
+                    )
+
+                address = key.address
+                key.secretKey.fill(0)
+
+                typeLabel = "ML-DSA"
+            }
+
+            ReceiveAddressType.SLHDSA -> {
+                addressIndex =
+                    currentPqAddressIndex(
+                        ReceiveAddressType.SLHDSA
+                    )
+
+                val key =
+                    derivePqKey(
+                        words,
+                        ReceiveAddressType.SLHDSA,
+                        addressIndex
+                    )
+
+                address = key.address
+                key.secretKey.fill(0)
+
+                typeLabel = "SPHINCS+"
+            }
+        }
 
         val content = baseLayout()
         content.addView(space(10))
@@ -2850,19 +3982,22 @@ class WalletActivity : FragmentActivity() {
             card {
                 addView(
                     sectionTitle(
-                        "Receive address ${addressIndex + 1}"
+                        "$typeLabel receive address ${addressIndex + 1}"
                     )
                 )
 
-                val currentLabel = addressLabel(addressIndex)
+                if (receiveType == ReceiveAddressType.STANDARD) {
+                    val currentLabel =
+                        addressLabel(addressIndex)
 
-                if (currentLabel.isNotBlank()) {
-                    addView(space(8))
-                    addView(
-                        smallStatus(
-                            "Label: $currentLabel"
+                    if (currentLabel.isNotBlank()) {
+                        addView(space(8))
+                        addView(
+                            smallStatus(
+                                "Label: $currentLabel"
+                            )
                         )
-                    )
+                    }
                 }
 
                 addView(space(14))
@@ -2903,9 +4038,10 @@ class WalletActivity : FragmentActivity() {
                     isFocusable = true
 
                     setOnClickListener {
-                        val clipboard = getSystemService(
-                            Context.CLIPBOARD_SERVICE
-                        ) as ClipboardManager
+                        val clipboard =
+                            getSystemService(
+                                Context.CLIPBOARD_SERVICE
+                            ) as ClipboardManager
 
                         clipboard.setPrimaryClip(
                             ClipData.newPlainText(
@@ -2929,36 +4065,58 @@ class WalletActivity : FragmentActivity() {
                         "Tap the address to copy it"
                     )
                 )
-                addView(space(12))
-                addView(
-                    secondaryButton("Edit address label") {
-                        val input =
-                            EditText(this@WalletActivity).apply {
-                                hint = "e.g. Mining, Pool payout, Personal"
-                                setText(addressLabel(addressIndex))
-                                setSelection(text.length)
-                            }
 
-                        AlertDialog.Builder(this@WalletActivity)
-                            .setTitle(
-                                "Address ${addressIndex + 1} label"
+                if (receiveType == ReceiveAddressType.STANDARD) {
+                    addView(space(12))
+                    addView(
+                        secondaryButton("Edit address label") {
+                            val input =
+                                EditText(
+                                    this@WalletActivity
+                                ).apply {
+                                    hint =
+                                        "e.g. Mining, Pool payout, Personal"
+                                    setText(
+                                        addressLabel(
+                                            addressIndex
+                                        )
+                                    )
+                                    setSelection(text.length)
+                                }
+
+                            AlertDialog.Builder(
+                                this@WalletActivity
                             )
-                            .setView(input)
-                            .setNegativeButton("Cancel", null)
-                            .setNeutralButton("Remove") { _, _ ->
-                                setAddressLabel(addressIndex, "")
-                                showReceive()
-                            }
-                            .setPositiveButton("Save") { _, _ ->
-                                setAddressLabel(
-                                    addressIndex,
-                                    input.text.toString()
+                                .setTitle(
+                                    "Address ${addressIndex + 1} label"
                                 )
-                                showReceive()
-                            }
-                            .show()
-                    }
-                )
+                                .setView(input)
+                                .setNegativeButton(
+                                    "Cancel",
+                                    null
+                                )
+                                .setNeutralButton(
+                                    "Remove"
+                                ) { _, _ ->
+                                    setAddressLabel(
+                                        addressIndex,
+                                        ""
+                                    )
+                                    showReceive()
+                                }
+                                .setPositiveButton(
+                                    "Save"
+                                ) { _, _ ->
+                                    setAddressLabel(
+                                        addressIndex,
+                                        input.text.toString()
+                                    )
+                                    showReceive()
+                                }
+                                .show()
+                        }
+                    )
+                }
             }
         )
 
@@ -2966,38 +4124,92 @@ class WalletActivity : FragmentActivity() {
 
         content.addView(
             card {
-                addView(sectionTitle("Address management"))
-                addView(space(12))
                 addView(
-                    secondaryButton("Manage address labels") {
-                        showAddressLabelManager()
-                    }
+                    sectionTitle(
+                        "Address management"
+                    )
                 )
-                addView(space(10))
+                addView(space(12))
+
                 addView(
-                    secondaryButton("Generate new address") {
+                    secondaryButton(
+                        "Generate new address"
+                    ) {
+                        val options =
+                            arrayOf(
+                                "Standard",
+                                "ML-DSA",
+                                "SPHINCS+"
+                            )
+
                         AlertDialog.Builder(
                             this@WalletActivity
                         )
-                            .setTitle("Generate new address?")
-                            .setMessage(
-                                "The current address will remain " +
-                                    "valid and the wallet will continue " +
-                                    "scanning it. A new address will be " +
-                                    "generated from the same recovery phrase."
+                            .setTitle(
+                                "Choose address type"
                             )
-                            .setNegativeButton("Cancel", null)
-                            .setPositiveButton("Generate") {
-                                    _, _ ->
-                                setCurrentReceiveAddressIndex(
-                                    addressIndex + 1
+                            .setItems(
+                                options
+                            ) { _, which ->
+                                val selectedType =
+                                    when (which) {
+                                        0 ->
+                                            ReceiveAddressType.STANDARD
+
+                                        1 ->
+                                            ReceiveAddressType.MLDSA
+
+                                        2 ->
+                                            ReceiveAddressType.SLHDSA
+
+                                        else ->
+                                            return@setItems
+                                    }
+
+                                when (selectedType) {
+                                    ReceiveAddressType.STANDARD -> {
+                                        setCurrentReceiveAddressIndex(
+                                            currentReceiveAddressIndex() + 1
+                                        )
+                                    }
+
+                                    ReceiveAddressType.MLDSA,
+                                    ReceiveAddressType.SLHDSA -> {
+                                        if (
+                                            pqAddressCreated(
+                                                selectedType
+                                            )
+                                        ) {
+                                            setCurrentPqAddressIndex(
+                                                selectedType,
+                                                currentPqAddressIndex(
+                                                    selectedType
+                                                ) + 1
+                                            )
+                                        } else {
+                                            setPqAddressCreated(
+                                                selectedType
+                                            )
+                                        }
+                                    }
+                                }
+
+                                setCurrentReceiveAddressType(
+                                    selectedType
                                 )
+
                                 showReceive()
                             }
+                            .setNegativeButton(
+                                "Cancel",
+                                null
+                            )
                             .show()
                     }
                 )
+
                 addView(space(10))
+
                 addView(
                     helpText(
                         "All previously generated addresses remain " +
@@ -3797,6 +5009,10 @@ class WalletActivity : FragmentActivity() {
 
                         val privateKeysByIndex =
                             latestSpendableUtxos
+                                .filter {
+                                    it.addressType ==
+                                        BlockScanner.AddressType.STANDARD
+                                }
                                 .map { it.addressIndex }
                                 .distinct()
                                 .associateWith { index ->
@@ -3806,30 +5022,88 @@ class WalletActivity : FragmentActivity() {
                                     )
                                 }
 
-                        val changePrivateKey =
-                            deriveWalletPrivateKey(
-                                words,
-                                currentReceiveAddressIndex()
-                            )
-
-                        val changePubKeyHash =
-                            Utils.sha256hash160(
-                                changePrivateKey.pubKey
-                            )
+                        val pqSigningKeys =
+                            linkedMapOf<
+                                Pair<BlockScanner.AddressType, Int>,
+                                VextaTransactionSender.PqSigningKey
+                            >()
 
                         val transaction =
-                            VextaTransactionSender.createAndSign(
-                                spendableUtxos =
-                                    latestSpendableUtxos,
-                                recipientAddress = recipient,
-                                amountSatoshis = amountSatoshis,
-                                privateKeysByIndex =
-                                    privateKeysByIndex,
-                                changePubKeyHash =
-                                    changePubKeyHash,
-                                chainHeight =
-                                    latestChainHeight
-                            )
+                            try {
+                                latestSpendableUtxos
+                                    .filter {
+                                        it.addressType !=
+                                            BlockScanner.AddressType.STANDARD
+                                    }
+                                    .distinctBy {
+                                        it.addressType to it.addressIndex
+                                    }
+                                    .forEach { utxo ->
+                                        val receiveType =
+                                            when (utxo.addressType) {
+                                                BlockScanner.AddressType.MLDSA ->
+                                                    ReceiveAddressType.MLDSA
+
+                                                BlockScanner.AddressType.SLHDSA ->
+                                                    ReceiveAddressType.SLHDSA
+
+                                                BlockScanner.AddressType.STANDARD ->
+                                                    error(
+                                                        "Standard UTXO is not PQ"
+                                                    )
+                                            }
+
+                                        val key =
+                                            derivePqKey(
+                                                words,
+                                                receiveType,
+                                                utxo.addressIndex
+                                            )
+
+                                        pqSigningKeys[
+                                            utxo.addressType to
+                                                utxo.addressIndex
+                                        ] =
+                                            VextaTransactionSender.PqSigningKey(
+                                                addressType =
+                                                    utxo.addressType,
+                                                publicKey =
+                                                    key.publicKey,
+                                                secretKey =
+                                                    key.secretKey
+                                            )
+                                    }
+
+                                val changePrivateKey =
+                                    deriveWalletPrivateKey(
+                                        words,
+                                        currentReceiveAddressIndex()
+                                    )
+
+                                val changePubKeyHash =
+                                    Utils.sha256hash160(
+                                        changePrivateKey.pubKey
+                                    )
+
+                                VextaTransactionSender.createAndSign(
+                                    spendableUtxos =
+                                        latestSpendableUtxos,
+                                    recipientAddress = recipient,
+                                    amountSatoshis = amountSatoshis,
+                                    privateKeysByIndex =
+                                        privateKeysByIndex,
+                                    pqSigningKeys =
+                                        pqSigningKeys,
+                                    changePubKeyHash =
+                                        changePubKeyHash,
+                                    chainHeight =
+                                        latestChainHeight
+                                )
+                            } finally {
+                                pqSigningKeys.values.forEach { key ->
+                                    key.secretKey.fill(0)
+                                }
+                            }
 
                         val amountDisplay = String.format(
                             "%.8f",
@@ -4138,10 +5412,36 @@ class WalletActivity : FragmentActivity() {
             MnemonicCode.INSTANCE.check(words)
             saveMnemonic(words.joinToString(" "))
 
-            getSharedPreferences(PREFS, MODE_PRIVATE)
-                .edit()
+            val preferences =
+                getSharedPreferences(PREFS, MODE_PRIVATE)
+
+            val editor = preferences.edit()
+
+            preferences.all.keys
+                .filter {
+                    it.startsWith(
+                        PREF_BACKGROUND_UTXO_PREFIX
+                    )
+                }
+                .forEach {
+                    editor.remove(it)
+                }
+
+            editor
+                .remove(PREF_BACKGROUND_TX_HISTORY)
+                .remove(PREF_LAST_BACKGROUND_SCAN_HEIGHT)
+                .remove(PREF_KNOWN_INCOMING_TXIDS)
+                .remove(PREF_OUTGOING_TRANSACTIONS)
                 .putBoolean(PREF_BACKUP_CONFIRMED, true)
                 .putInt(PREF_RECEIVE_ADDRESS_INDEX, 0)
+                .putInt(PREF_MLDSA_ADDRESS_INDEX, 0)
+                .putInt(PREF_SLHDSA_ADDRESS_INDEX, 0)
+                .putBoolean(PREF_MLDSA_ADDRESS_CREATED, false)
+                .putBoolean(PREF_SLHDSA_ADDRESS_CREATED, false)
+                .putString(
+                    PREF_RECEIVE_ADDRESS_TYPE,
+                    ReceiveAddressType.STANDARD.name
+                )
                 .putBoolean(
                     PREF_RESTORE_ADDRESS_DISCOVERY,
                     true
@@ -4502,8 +5802,12 @@ class WalletActivity : FragmentActivity() {
         hrp: String,
         data: List<Int>
     ): List<Int> {
+        val witnessVersion = data.firstOrNull() ?: 0
+        val checksumConstant =
+            if (witnessVersion == 0) 1 else 0x2bc830a3
+
         val values = expandBech32Hrp(hrp) + data + List(6) { 0 }
-        val polymod = bech32Polymod(values) xor 1
+        val polymod = bech32Polymod(values) xor checksumConstant
 
         return (0 until 6).map { index ->
             (polymod shr (5 * (5 - index))) and 31

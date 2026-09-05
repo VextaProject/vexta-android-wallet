@@ -17,6 +17,7 @@ if (keystorePropertiesFile.exists()) {
 android {
     namespace = "org.vextaproject.wallet"
     compileSdk = 36
+    ndkVersion = "27.3.13750724"
 
     defaultConfig {
         applicationId = "org.vextaproject.wallet"
@@ -42,7 +43,19 @@ android {
         }
     }
 
+    externalNativeBuild {
+        cmake {
+            version = "3.22.1"
+            path = file("src/main/cpp/CMakeLists.txt")
+        }
+    }
+
     buildTypes {
+        getByName("debug") {
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-debug"
+        }
+
         getByName("release") {
             if (keystorePropertiesFile.exists()) {
                 signingConfig = signingConfigs.getByName("release")
