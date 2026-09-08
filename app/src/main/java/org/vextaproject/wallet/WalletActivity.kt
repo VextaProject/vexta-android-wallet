@@ -1825,22 +1825,56 @@ class WalletActivity : FragmentActivity() {
     ) {
         Thread {
             try {
-                val nestExJson =
-                    org.json.JSONObject(
-                        java.net.URL(
-                            "https://trade.nestex.one/api/cg/tickers/VTX_USDT"
-                        ).readText()
+                fun readJson(url: String): org.json.JSONObject {
+                    val connection =
+                        java.net.URL(url)
+                            .openConnection() as
+                            java.net.HttpURLConnection
+
+                    try {
+                        connection.requestMethod = "GET"
+                        connection.connectTimeout = 10_000
+                        connection.readTimeout = 10_000
+                        connection.useCaches = false
+                        connection.setRequestProperty(
+                            "User-Agent",
+                            "Mozilla/5.0"
+                        )
+                        connection.setRequestProperty(
+                            "Accept",
+                            "application/json"
+                        )
+
+                        if (connection.responseCode !in 200..299) {
+                            throw java.io.IOException(
+                                "HTTP ${connection.responseCode} for $url"
+                            )
+                        }
+
+                        return org.json.JSONObject(
+                            connection.inputStream
+                                .bufferedReader()
+                                .use { it.readText() }
+                        )
+                    } finally {
+                        connection.disconnect()
+                    }
+                }
+
+                val priceJson =
+                    readJson(
+                        "https://vexta-pool.co.uk/vextaprice.json"
                     )
 
                 val vtxUsdt =
-                    nestExJson.getString("last_price")
+                    priceJson.getString("price")
                         .toDouble()
 
+                require(vtxUsdt > 0.0)
+
                 val fxJson =
-                    org.json.JSONObject(
-                        java.net.URL(
-                            "https://api.frankfurter.app/latest?from=USD&to=GBP,EUR"
-                        ).readText()
+                    readJson(
+                        "https://api.frankfurter.app/latest?from=USD&to=GBP,EUR"
                     )
 
                 val rates =
@@ -1869,7 +1903,12 @@ class WalletActivity : FragmentActivity() {
                 runOnUiThread {
                     onLoaded(values)
                 }
-            } catch (_: Exception) {
+            } catch (error: Exception) {
+                android.util.Log.e(
+                    "VextaFiat",
+                    "Unable to load fiat values",
+                    error
+                )
             }
         }.start()
     }
