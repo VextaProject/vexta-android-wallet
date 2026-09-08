@@ -391,7 +391,16 @@ class WalletMonitoringService : Service() {
                         }
                         .filter { it.netSatoshis != 0L }
 
-                if (fullScanRequired) {
+                val notificationsInitialized =
+                    preferences.getBoolean(
+                        PREF_TX_NOTIFICATIONS_INITIALIZED,
+                        false
+                    )
+
+                if (
+                    fullScanRequired &&
+                    !notificationsInitialized
+                ) {
                     synchronizeKnownIncomingTransactions(
                         mergedTransactions
                     )

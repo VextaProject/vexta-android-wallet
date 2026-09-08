@@ -3627,7 +3627,7 @@ class WalletActivity : FragmentActivity() {
                         symbol = "↑",
                         label = "Send"
                     ) {
-                        showSend(address)
+                        showSend()
                     }
                 )
 
@@ -4915,12 +4915,12 @@ class WalletActivity : FragmentActivity() {
         contactsDialog.show()
     }
 
-    private fun showSend(fromAddress: String) {
+    private fun showSend() {
         mainWalletVisible = false
         window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
 
         val recipientInput = inputField(
-            hint = "Recipient address (vtx1... or legacy V...)",
+            hint = "Recipient Vexta address",
             singleLine = false
         )
 
@@ -4938,6 +4938,67 @@ class WalletActivity : FragmentActivity() {
                 "directly to the Vexta network."
         )
 
+        var spendFromType: BlockScanner.AddressType? = null
+
+        fun selectedSpendableUtxos():
+            List<BlockScanner.SpendableUtxo> {
+            return if (spendFromType == null) {
+                latestSpendableUtxos
+            } else {
+                latestSpendableUtxos.filter {
+                    it.addressType == spendFromType
+                }
+            }
+        }
+
+        lateinit var spendFromButton: Button
+
+        spendFromButton =
+            secondaryButton("Spend from: Any") {
+                val options =
+                    arrayOf(
+                        "Any",
+                        "Standard",
+                        "ML-DSA",
+                        "SPHINCS+"
+                    )
+
+                AlertDialog.Builder(this@WalletActivity)
+                    .setTitle("Spend from")
+                    .setItems(options) { _, which ->
+                        spendFromType =
+                            when (which) {
+                                0 -> null
+                                1 ->
+                                    BlockScanner.AddressType.STANDARD
+                                2 ->
+                                    BlockScanner.AddressType.MLDSA
+                                3 ->
+                                    BlockScanner.AddressType.SLHDSA
+                                else -> null
+                            }
+
+                        spendFromButton.text =
+                            "Spend from: ${options[which]}"
+
+                        val available =
+                            selectedSpendableUtxos()
+                                .sumOf { it.value }
+
+                        noteView.text =
+                            "Selected source: ${options[which]}\n" +
+                                "Available: " +
+                                String.format(
+                                    java.util.Locale.US,
+                                    "%.8f VTX",
+                                    available.toDouble() /
+                                        100_000_000.0
+                                )
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .show()
+            }
+
         val content = baseLayout()
         content.addView(space(10))
         content.addView(centeredLogo(72))
@@ -4948,9 +5009,9 @@ class WalletActivity : FragmentActivity() {
 
         content.addView(
             card {
-                addView(sectionTitle("From"))
+                addView(sectionTitle("Spend source"))
                 addView(space(10))
-                addView(infoBox(fromAddress, 15f, Gravity.CENTER))
+                addView(spendFromButton)
             }
         )
 
@@ -5028,7 +5089,7 @@ class WalletActivity : FragmentActivity() {
                         try {
                             val maxSpend =
                                 VextaTransactionSender.calculateMaxSpend(
-                                    latestSpendableUtxos,
+                                    selectedSpendableUtxos(),
                                     latestChainHeight
                                 )
 
@@ -5126,11 +5187,14 @@ class WalletActivity : FragmentActivity() {
                         return@primaryButton
                     }
 
-                    if (latestSpendableUtxos.isEmpty()) {
+                    val spendableUtxos =
+                        selectedSpendableUtxos()
+
+                    if (spendableUtxos.isEmpty()) {
                         Toast.makeText(
                             this@WalletActivity,
-                            "No verified spendable outputs are loaded. " +
-                                "Return to the wallet and scan the blockchain.",
+                            "No verified spendable outputs are available " +
+                                "for the selected source.",
                             Toast.LENGTH_LONG
                         ).show()
                         return@primaryButton
@@ -5146,7 +5210,7 @@ class WalletActivity : FragmentActivity() {
                             .split(Regex("\\s+"))
 
                         val privateKeysByIndex =
-                            latestSpendableUtxos
+                            spendableUtxos
                                 .filter {
                                     it.addressType ==
                                         BlockScanner.AddressType.STANDARD
@@ -5168,7 +5232,7 @@ class WalletActivity : FragmentActivity() {
 
                         val transaction =
                             try {
-                                latestSpendableUtxos
+                                spendableUtxos
                                     .filter {
                                         it.addressType !=
                                             BlockScanner.AddressType.STANDARD
@@ -5225,7 +5289,7 @@ class WalletActivity : FragmentActivity() {
 
                                 VextaTransactionSender.createAndSign(
                                     spendableUtxos =
-                                        latestSpendableUtxos,
+                                        spendableUtxos,
                                     recipientAddress = recipient,
                                     amountSatoshis = amountSatoshis,
                                     privateKeysByIndex =
