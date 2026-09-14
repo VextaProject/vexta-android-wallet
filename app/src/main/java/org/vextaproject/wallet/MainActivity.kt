@@ -40,6 +40,8 @@ class MainActivity : Activity() {
         private const val TARGET_TIMESPAN = AVERAGING_WINDOW * TARGET_SPACING
         private const val MIN_TIMESPAN = TARGET_TIMESPAN * 92 / 100
         private const val MAX_TIMESPAN = TARGET_TIMESPAN * 116 / 100
+        private const val ASERT_ACTIVATION_HEIGHT = 6500
+        private const val ASERT_HALF_LIFE = 2L * 24L * 60L * 60L
 
         private val POW_LIMIT =
             BigInteger.ONE.shiftLeft(256).subtract(BigInteger.ONE).shiftRight(20)
@@ -470,6 +472,11 @@ class MainActivity : Activity() {
 
     private fun expectedBits(chain: List<ChainHeader>): Long {
         val last = chain.last()
+        val nextHeight = last.height + 1
+
+        if (nextHeight >= ASERT_ACTIVATION_HEIGHT) {
+            return calculateAsertBits(chain)
+        }
 
         if (last.height < AVERAGING_WINDOW) {
             return targetToCompact(POW_LIMIT)
@@ -500,6 +507,84 @@ class MainActivity : Activity() {
         }
 
         return targetToCompact(newTarget)
+    }
+
+    private fun calculateAsertBits(chain: List<ChainHeader>): Long {
+        val last = chain.last()
+
+        val anchorHeight = ASERT_ACTIVATION_HEIGHT - 1
+        val anchor = chain[anchorHeight]
+        val anchorPrevious = chain[anchorHeight - 1]
+
+        val heightDiff = last.height - anchor.height
+        val timeDiff = last.time - anchorPrevious.time
+
+        val idealTime = (heightDiff + 1L) * TARGET_SPACING
+
+        val exponent =
+            ((timeDiff - idealTime) * 65536L) / ASERT_HALF_LIFE
+
+        var shifts = exponent shr 16
+        val frac = exponent and 0xffffL
+        val fracBig = BigInteger.valueOf(frac)
+
+        val factor =
+            BigInteger.valueOf(65536L)
+                .add(
+                    BigInteger.valueOf(195766423245049L)
+                        .multiply(fracBig)
+                        .add(
+                            BigInteger.valueOf(971821376L)
+                                .multiply(fracBig.pow(2))
+                        )
+                        .add(
+                            BigInteger.valueOf(5127L)
+                                .multiply(fracBig.pow(3))
+                        )
+                        .add(BigInteger.ONE.shiftLeft(47))
+                        .shiftRight(48)
+                )
+                .toLong()
+
+        var target =
+            compactToTarget(anchor.bits)
+                .multiply(BigInteger.valueOf(factor))
+
+        shifts -= 16
+
+        if (shifts <= 0) {
+            val rightShift = -shifts
+            target =
+                if (rightShift >= 256) {
+                    BigInteger.ONE
+                } else {
+                    target.shiftRight(rightShift.toInt())
+                }
+        } else {
+            if (shifts >= 256) {
+                target = POW_LIMIT
+            } else {
+                val maxBeforeShift =
+                    POW_LIMIT.shiftRight(shifts.toInt())
+
+                target =
+                    if (target > maxBeforeShift) {
+                        POW_LIMIT
+                    } else {
+                        target.shiftLeft(shifts.toInt())
+                    }
+            }
+        }
+
+        if (target <= BigInteger.ZERO) {
+            target = BigInteger.ONE
+        }
+
+        if (target > POW_LIMIT) {
+            target = POW_LIMIT
+        }
+
+        return targetToCompact(target)
     }
 
     private fun medianTimePast(
