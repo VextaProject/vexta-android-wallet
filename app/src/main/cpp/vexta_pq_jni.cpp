@@ -5,6 +5,8 @@
 #include <vector>
 
 #include "pq/pq.h"
+#include <randomx.h>
+#include <mutex>
 
 namespace {
 
@@ -342,4 +344,133 @@ Java_org_vextaproject_wallet_VextaPQ_sphincsVerify(
         message.size(),
         public_key.data()
     ) ? JNI_TRUE : JNI_FALSE;
+}
+
+namespace {
+
+std::mutex g_randomx_mutex;
+randomx_cache* g_randomx_cache = nullptr;
+randomx_vm* g_randomx_vm = nullptr;
+std::array<uint8_t, 32> g_randomx_seed{};
+bool g_randomx_seed_initialized = false;
+
+bool prepare_randomx_vm(
+    const std::array<uint8_t, 32>& seed)
+{
+    if (
+        g_randomx_vm != nullptr &&
+        g_randomx_cache != nullptr &&
+        g_randomx_seed_initialized &&
+        g_randomx_seed == seed
+    ) {
+        return true;
+    }
+
+    if (g_randomx_vm != nullptr) {
+        randomx_destroy_vm(g_randomx_vm);
+        g_randomx_vm = nullptr;
+    }
+
+    if (g_randomx_cache != nullptr) {
+        randomx_release_cache(g_randomx_cache);
+        g_randomx_cache = nullptr;
+    }
+
+    g_randomx_seed_initialized = false;
+
+    g_randomx_cache =
+        randomx_alloc_cache(RANDOMX_FLAG_DEFAULT);
+
+    if (g_randomx_cache == nullptr) {
+        return false;
+    }
+
+    randomx_init_cache(
+        g_randomx_cache,
+        seed.data(),
+        seed.size()
+    );
+
+    g_randomx_vm =
+        randomx_create_vm(
+            RANDOMX_FLAG_DEFAULT,
+            g_randomx_cache,
+            nullptr
+        );
+
+    if (g_randomx_vm == nullptr) {
+        randomx_release_cache(g_randomx_cache);
+        g_randomx_cache = nullptr;
+        return false;
+    }
+
+    g_randomx_seed = seed;
+    g_randomx_seed_initialized = true;
+
+    return true;
+}
+
+} // namespace
+
+extern "C"
+JNIEXPORT jbyteArray JNICALL
+Java_org_vextaproject_wallet_VextaPQ_randomxHash(
+    JNIEnv* env,
+    jobject,
+    jbyteArray header_array,
+    jbyteArray seed_array)
+{
+    if (header_array == nullptr ||
+        seed_array == nullptr ||
+        env->GetArrayLength(header_array) != 80 ||
+        env->GetArrayLength(seed_array) != 32) {
+        return nullptr;
+    }
+
+    std::array<uint8_t, 80> header{};
+    std::array<uint8_t, 32> seed{};
+    std::array<uint8_t, 32> output{};
+
+    env->GetByteArrayRegion(
+        header_array,
+        0,
+        80,
+        reinterpret_cast<jbyte*>(header.data())
+    );
+
+    if (env->ExceptionCheck()) {
+        return nullptr;
+    }
+
+    env->GetByteArrayRegion(
+        seed_array,
+        0,
+        32,
+        reinterpret_cast<jbyte*>(seed.data())
+    );
+
+    if (env->ExceptionCheck()) {
+        return nullptr;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_randomx_mutex);
+
+        if (!prepare_randomx_vm(seed)) {
+            return nullptr;
+        }
+
+        randomx_calculate_hash(
+            g_randomx_vm,
+            header.data(),
+            header.size(),
+            output.data()
+        );
+    }
+
+    return to_jbyte_array(
+        env,
+        output.data(),
+        output.size()
+    );
 }

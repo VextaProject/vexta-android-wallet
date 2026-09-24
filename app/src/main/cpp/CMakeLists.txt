@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.22.1)
 
 project(vextapq LANGUAGES C CXX)
 
+# RandomX 1.2.3 - same version used by Vexta Core v0.3.0
+add_subdirectory(randomx EXCLUDE_FROM_ALL)
+
 add_library(
     vextapq
     SHARED
@@ -40,6 +43,7 @@ target_include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/pq
     ${CMAKE_CURRENT_SOURCE_DIR}/pq/mldsa65
     ${CMAKE_CURRENT_SOURCE_DIR}/pq/sphincsplus
+    ${CMAKE_CURRENT_SOURCE_DIR}/randomx/src
 )
 
 target_compile_definitions(
@@ -53,5 +57,6 @@ find_library(log-lib log)
 
 target_link_libraries(
     vextapq
+    randomx
     ${log-lib}
 )

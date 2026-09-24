@@ -34,6 +34,17 @@ object HeaderSync {
     private const val ASERT_ACTIVATION_HEIGHT = 6500
     private const val ASERT_HALF_LIFE = 2L * 24L * 60L * 60L
 
+    private const val MULTI_ALGO_ACTIVATION_HEIGHT = 8099
+
+    private const val ALGO_SHA256D = 0
+    private const val ALGO_RANDOMX = 1
+
+    private const val BLOCK_VERSION_ALGO = 15 shl 8
+    private const val BLOCK_VERSION_SHA256D = 2 shl 8
+    private const val BLOCK_VERSION_RANDOMX = 4 shl 8
+    private const val RANDOMX_SEED_EPOCH_LENGTH = 2048
+    private const val RANDOMX_SEED_LAG = 64
+
     private val POW_LIMIT =
         BigInteger.ONE.shiftLeft(256).subtract(BigInteger.ONE).shiftRight(20)
 
@@ -49,7 +60,8 @@ object HeaderSync {
         val hashWire: ByteArray,
         val hashDisplay: String,
         val time: Long,
-        val bits: Long
+        val bits: Long,
+        val version: Int
     )
 
     data class SyncResult(
@@ -67,13 +79,17 @@ object HeaderSync {
                 hashWire = hashHexToWireBytes(GENESIS_HASH),
                 hashDisplay = GENESIS_HASH,
                 time = GENESIS_TIME,
-                bits = GENESIS_BITS
+                bits = GENESIS_BITS,
+                version = 2 shl 8
             )
         )
 
         val file = File(context.filesDir, "vexta-headers.dat")
+        val validationFile =
+            File(context.filesDir, "vexta-headers.validated")
 
         if (!file.exists()) {
+            validationFile.delete()
             return chain
         }
 
@@ -81,10 +97,16 @@ object HeaderSync {
 
         if (data.size % 80 != 0) {
             file.delete()
+            validationFile.delete()
             return chain
         }
 
         try {
+            if (isValidatedHeaderCache(validationFile, data)) {
+                loadTrustedCachedHeaders(chain, data)
+                return chain
+            }
+
             var offset = 0
 
             while (offset < data.size) {
@@ -92,8 +114,11 @@ object HeaderSync {
                 appendVerifiedHeader(chain, raw)
                 offset += 80
             }
+
+            writeHeaderValidationMarker(validationFile, data)
         } catch (_: Exception) {
             file.delete()
+            validationFile.delete()
             return mutableListOf(chain.first())
         }
 
@@ -103,6 +128,8 @@ object HeaderSync {
     fun saveChain(context: Context, chain: List<ChainHeader>) {
         val file = File(context.filesDir, "vexta-headers.dat")
         val temporary = File(context.filesDir, "vexta-headers.tmp")
+        val validationFile =
+            File(context.filesDir, "vexta-headers.validated")
 
         temporary.outputStream().use { output ->
             chain.drop(1).forEach { header ->
@@ -119,6 +146,122 @@ object HeaderSync {
 
         if (!temporary.renameTo(file)) {
             throw IllegalStateException("unable to save header database")
+        }
+
+        writeHeaderValidationMarker(
+            validationFile,
+            file.readBytes()
+        )
+    }
+
+    private fun loadTrustedCachedHeaders(
+        chain: MutableList<ChainHeader>,
+        data: ByteArray
+    ) {
+        var offset = 0
+
+        while (offset < data.size) {
+            val raw = data.copyOfRange(offset, offset + 80)
+            val previous = chain.last()
+            val previousHash = raw.copyOfRange(4, 36)
+
+            if (!previousHash.contentEquals(previous.hashWire)) {
+                throw IllegalStateException(
+                    "cached header linkage failed at height " +
+                        "${previous.height + 1}"
+                )
+            }
+
+            val buffer =
+                ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+
+            val version = buffer.getInt(0)
+            val time =
+                buffer.getInt(68).toLong() and 0xffffffffL
+            val bits =
+                buffer.getInt(72).toLong() and 0xffffffffL
+
+            val hashWire = doubleSha256(raw)
+
+            chain.add(
+                ChainHeader(
+                    height = previous.height + 1,
+                    raw = raw,
+                    hashWire = hashWire,
+                    hashDisplay = hashWire.reversedArray().toHex(),
+                    time = time,
+                    bits = bits,
+                    version = version
+                )
+            )
+
+            offset += 80
+        }
+    }
+
+    private fun isValidatedHeaderCache(
+        validationFile: File,
+        data: ByteArray
+    ): Boolean {
+        if (!validationFile.exists()) {
+            return false
+        }
+
+        return try {
+            val lines = validationFile.readLines()
+
+            if (lines.size != 3 || lines[0] != "v1") {
+                false
+            } else {
+                val expectedSize = lines[1].toLongOrNull()
+                    ?: return false
+                val expectedHash = lines[2].trim()
+
+                expectedSize == data.size.toLong() &&
+                    expectedHash.equals(
+                        sha256Hex(data),
+                        ignoreCase = true
+                    )
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun writeHeaderValidationMarker(
+        validationFile: File,
+        data: ByteArray
+    ) {
+        val temporary =
+            File(
+                validationFile.parentFile,
+                validationFile.name + ".tmp"
+            )
+
+        temporary.writeText(
+            "v1\n" +
+                "${data.size}\n" +
+                "${sha256Hex(data)}\n"
+        )
+
+        if (validationFile.exists()) {
+            validationFile.delete()
+        }
+
+        if (!temporary.renameTo(validationFile)) {
+            temporary.delete()
+            throw IllegalStateException(
+                "unable to save header validation marker"
+            )
+        }
+    }
+
+    private fun sha256Hex(data: ByteArray): String {
+        val digest =
+            MessageDigest.getInstance("SHA-256").digest(data)
+
+        return digest.joinToString("") {
+            "%02x".format(it.toInt() and 0xff)
         }
     }
 
@@ -287,6 +430,7 @@ object HeaderSync {
         }
 
         val buffer = ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN)
+        val version = buffer.getInt(0)
         val time = buffer.getInt(68).toLong() and 0xffffffffL
         val bits = buffer.getInt(72).toLong() and 0xffffffffL
 
@@ -298,22 +442,61 @@ object HeaderSync {
             )
         }
 
+        val height = previous.height + 1
         val hashWire = doubleSha256(raw)
-        val hashNumber = BigInteger(1, hashWire.reversedArray())
 
-        if (hashNumber > target) {
-            throw IllegalStateException(
-                "proof of work failed at height ${previous.height + 1}"
-            )
-        }
-
-        val expectedBits = expectedBits(chain)
+        val expectedBits = expectedBits(chain, version)
 
         if (bits != expectedBits) {
             throw IllegalStateException(
-                "difficulty mismatch at height ${previous.height + 1}: " +
+                "difficulty mismatch at height $height: " +
                     "expected ${expectedBits.toString(16)}, " +
                     "received ${bits.toString(16)}"
+            )
+        }
+
+        val powHash =
+            if (height >= MULTI_ALGO_ACTIVATION_HEIGHT) {
+                when (algoFromVersion(version)) {
+                    ALGO_SHA256D ->
+                        hashWire
+
+                    ALGO_RANDOMX -> {
+                        val seedHeight =
+                            randomXSeedHeight(height)
+
+                        if (seedHeight !in chain.indices) {
+                            throw IllegalStateException(
+                                "RandomX seed height $seedHeight unavailable " +
+                                    "for block $height"
+                            )
+                        }
+
+                        requireNotNull(
+                            VextaPQ.randomxHash(
+                                raw,
+                                chain[seedHeight].hashWire
+                            )
+                        ) {
+                            "RandomX hash calculation failed at height $height"
+                        }
+                    }
+
+                    else ->
+                        throw IllegalStateException(
+                            "unknown mining algorithm at height $height"
+                        )
+                }
+            } else {
+                hashWire
+            }
+
+        val hashNumber =
+            BigInteger(1, powHash.reversedArray())
+
+        if (hashNumber > target) {
+            throw IllegalStateException(
+                "proof of work failed at height $height"
             )
         }
 
@@ -324,14 +507,52 @@ object HeaderSync {
                 hashWire = hashWire,
                 hashDisplay = hashWire.reversedArray().toHex(),
                 time = time,
-                bits = bits
+                bits = bits,
+                version = version
             )
         )
     }
 
-    fun expectedBits(chain: List<ChainHeader>): Long {
+    private fun randomXSeedHeight(
+        blockHeight: Int
+    ): Int {
+        val epochStart =
+            (blockHeight / RANDOMX_SEED_EPOCH_LENGTH) *
+                RANDOMX_SEED_EPOCH_LENGTH
+
+        return if (epochStart > RANDOMX_SEED_LAG) {
+            epochStart - RANDOMX_SEED_LAG
+        } else {
+            0
+        }
+    }
+
+    private fun algoFromVersion(version: Int): Int {
+        return when (version and BLOCK_VERSION_ALGO) {
+            BLOCK_VERSION_SHA256D -> ALGO_SHA256D
+            BLOCK_VERSION_RANDOMX -> ALGO_RANDOMX
+            else -> -1
+        }
+    }
+
+    fun expectedBits(
+        chain: List<ChainHeader>,
+        nextVersion: Int
+    ): Long {
         val last = chain.last()
         val nextHeight = last.height + 1
+
+        if (nextHeight >= MULTI_ALGO_ACTIVATION_HEIGHT) {
+            val algo = algoFromVersion(nextVersion)
+
+            if (algo != ALGO_SHA256D && algo != ALGO_RANDOMX) {
+                throw IllegalStateException(
+                    "unknown mining algorithm at height $nextHeight"
+                )
+            }
+
+            return calculateMultiAlgoBits(chain, algo)
+        }
 
         if (nextHeight >= ASERT_ACTIVATION_HEIGHT) {
             return calculateAsertBits(chain)
@@ -360,6 +581,99 @@ object HeaderSync {
             compactToTarget(last.bits)
                 .multiply(BigInteger.valueOf(actualTimespan))
                 .divide(BigInteger.valueOf(TARGET_TIMESPAN))
+
+        if (newTarget > POW_LIMIT) {
+            newTarget = POW_LIMIT
+        }
+
+        return targetToCompact(newTarget)
+    }
+
+    private fun calculateMultiAlgoBits(
+        chain: List<ChainHeader>,
+        algo: Int
+    ): Long {
+        val last = chain.last()
+
+        val previousAlgo = chain.asReversed().firstOrNull {
+            algoFromVersion(it.version) == algo
+        }
+
+        if (previousAlgo == null) {
+            return if (algo == ALGO_RANDOMX) {
+                0x1d359bc1L
+            } else {
+                targetToCompact(POW_LIMIT)
+            }
+        }
+
+        val averagingBlocks = AVERAGING_WINDOW * 2
+
+        if (last.height < averagingBlocks) {
+            return previousAlgo.bits
+        }
+
+        val first = chain[last.height - averagingBlocks]
+
+        val targetTimespan =
+            averagingBlocks * TARGET_SPACING
+
+        var actualTimespan =
+            medianTimePast(chain, last.height) -
+                medianTimePast(chain, first.height)
+
+        actualTimespan =
+            targetTimespan +
+                (actualTimespan - targetTimespan) / 4
+
+        val minTimespan =
+            targetTimespan * 92 / 100
+
+        val maxTimespan =
+            targetTimespan * 116 / 100
+
+        actualTimespan = actualTimespan.coerceIn(
+            minTimespan,
+            maxTimespan
+        )
+
+        var newTarget =
+            compactToTarget(previousAlgo.bits)
+                .multiply(BigInteger.valueOf(actualTimespan))
+                .divide(BigInteger.valueOf(targetTimespan))
+
+        val numberOfAlgos = 2
+
+        val adjustments =
+            previousAlgo.height +
+                numberOfAlgos -
+                1 -
+                last.height
+
+        if (adjustments > 0) {
+            repeat(adjustments) {
+                newTarget =
+                    newTarget
+                        .multiply(BigInteger.valueOf(100))
+                        .divide(BigInteger.valueOf(104))
+            }
+        } else if (adjustments < 0) {
+            for (i in 0 until -adjustments) {
+                newTarget =
+                    newTarget
+                        .multiply(BigInteger.valueOf(104))
+                        .divide(BigInteger.valueOf(100))
+
+                if (newTarget > POW_LIMIT) {
+                    newTarget = POW_LIMIT
+                    break
+                }
+            }
+        }
+
+        if (newTarget <= BigInteger.ZERO) {
+            newTarget = BigInteger.ONE
+        }
 
         if (newTarget > POW_LIMIT) {
             newTarget = POW_LIMIT

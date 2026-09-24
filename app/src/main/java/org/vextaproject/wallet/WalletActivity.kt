@@ -412,12 +412,16 @@ class WalletActivity : FragmentActivity() {
         }
 
         if (walletExists()) {
-            authenticateWallet(
-                title = "Unlock Vexta Wallet",
-                subtitle = "Use biometrics or your device screen lock"
-            ) {
-                showMainWallet()
-            }
+            window.decorView.postDelayed({
+                if (!isFinishing && !isDestroyed) {
+                    authenticateWallet(
+                        title = "Unlock Vexta Wallet",
+                        subtitle = "Use biometrics or your device screen lock"
+                    ) {
+                        showMainWallet()
+                    }
+                }
+            }, 500L)
         } else {
             showWelcome()
         }

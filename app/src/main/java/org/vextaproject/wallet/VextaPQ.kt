@@ -36,4 +36,9 @@ object VextaPQ {
         message: ByteArray,
         publicKey: ByteArray
     ): Boolean
+
+    external fun randomxHash(
+        header: ByteArray,
+        seed: ByteArray
+    ): ByteArray?
 }
